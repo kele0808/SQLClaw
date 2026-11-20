@@ -126,6 +126,7 @@ class EditDecision(BaseModel):
 - `UNRESOLVABLE` → `failed`，消息"请说明具体名称或条件"。用于"上一个结果里第一个部门"这类指向结果数据的指代：MVP 不把结果发给模型，因此无法解析指向结果行的代词，只支持指向上一轮 IR 中已有过滤值、维度、指标的指代（这是对 17.5 修订"指代消解指向上一轮结果中的实体"的收窄，原因见第 7 节）。
 - 跨轮 release 变化：续问总是使用当前活跃 release。若父查询的 IR 在新 release 上规划失败且错误为 `UNKNOWN_*`/`OBJECT_STALE`，返回 `failed`，消息"元数据已更新，上一轮的口径不再适用，请重新提问"（架构 17.5"旧 Query IR 也需要检查兼容性"）。
 - `turn_index = 父查询 turn_index + 1`；会话最多 20 轮，超过返回 `CONVERSATION_TOO_LONG`。
+- 评测多轮题：`AgentPredictor`（Spec 08）对 Spec 03 题目的 `turns` 依次调用 `continue_query(message=…)`，以最后一轮作为 `Prediction`；中间某轮不是 `completed` 时以该轮状态作为结果。实现后多轮题不再返回 `SKIPPED`。
 
 口径调整选项（`adjustments.suggest(planned_ir, bundle) -> list[Adjustment]`，随 API 响应返回，页面渲染为按钮）：
 
@@ -193,7 +194,7 @@ def analyze_impact(changes: Sequence[SchemaChange], bundle: ReleaseBundle) -> li
 
 **`metadata_rename_mapping`**：`id`；`datasource_id`；`object_type`；`old_key`；`new_key`；`created_by`；`created_at`。
 
-队列任务 `metadata.sync_and_diff`（payload 同 Spec 02 的 `metadata.sync`）：采集保存快照 → 快照有变化（`unchanged = false`）且存在活跃 release 时执行 Diff、写事件、标记 STALE → 任务结果写入日志与 `jobs` 的 `payload.result`（变更数、STALE 数、新快照 ID）。
+队列任务 `metadata.sync_and_diff`（payload 同 Spec 02 的 `metadata.sync`）：采集保存快照 → 快照有变化（`unchanged = false`）且存在活跃 release 时执行 Diff、写事件、标记 STALE → 任务摘要（变更数、STALE 数、新快照 ID）写入日志（带任务的 `trace_id`）；变更明细通过 `GET /api/v1/metadata/changes` 查询。Spec 01 的 `jobs` 表不存放任务结果，本 Spec 不为此修改队列。
 
 ### 4.4 D3 发布与回滚（架构 5.5、16.1 修订）
 
@@ -237,7 +238,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 | POST | `/feedback` | 本人的查询 | `{"query_id", "rating": "up"\|"down", "comment"}`（评论 ≤ 500 字）|
 | GET | `/datasources` | 任意 | 当前数据源：`datasource_id`、`dialect`、`db_version`、`active_release_id` |
 | POST | `/metadata/sync` | `admin` | 入队 `metadata.sync_and_diff`，`202 {"job_id"}` |
-| GET | `/jobs/{id}` | `admin` | 任务状态与结果（新增，异步同步与评测需要查询进度） |
+| GET | `/jobs/{id}` | `admin` | 任务的 `kind`、`status`、`attempts`、`last_error`、`trace_id`（Spec 01 `jobs` 表字段；新增，异步同步与评测需要查询进度）；评测结果按 `trace_id` 对应的 `eval_run` 查询 |
 | GET | `/metadata/releases` | `admin` | release 列表（组件、状态、评测结论、是否活跃） |
 | POST | `/metadata/releases` | `admin` | 构建候选 release（`build_candidate_release`），返回 ID（新增） |
 | POST | `/metadata/releases/{id}/publish` | `admin` | 带门禁发布，请求体 `{"reason", "regression_note"}`（新增） |
@@ -261,7 +262,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 ### 4.7 D6 应用容器化
 
 - `deployment/docker/Dockerfile`：`python:3.12-slim`，复制 `uv`，`uv sync --frozen --no-dev`，以非 root 用户运行；同一镜像通过命令区分 `api`（`uvicorn`）与 `worker`（`python -m text2sql.jobs.worker`）。
-- `deployment/compose.yaml` 增加 `api`、`worker` 两个服务，放在 `profiles: [app]` 中；默认 `docker compose up` 仍只起数据库（不影响 Spec 01 的开发方式），`--profile app` 时起完整 MVP（架构第二十一章修订）。
+- 按 Spec 01 4.8 的 profile 约定，在 `deployment/compose.yaml` 加入 `api`、`worker` 两个服务，放在 `profiles: [app]` 中；默认 `docker compose up` 仍只起数据库，`--profile app` 时起完整 MVP（架构第二十一章修订）。两个服务依赖数据库服务的 healthcheck；`api` 映射宿主端口 8000。
 
 ### 4.8 D7 MVP 验收
 
@@ -269,7 +270,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 
 ## 5. 验收标准
 
-1. 多轮（集成，`FakeLLM` 脚本化 `edit_ir`）：17.5 的三轮示例（"最近 30 天各行业工单数" → "只看已完成的" → "按数量从高到低排序"）每轮 IR 与 SQL 正确，`turn_index` 递增，第三轮仍带第一轮的默认口径标注。
+1. 多轮（集成，`FakeLLM` 脚本化 `edit_ir`）：17.5 的三轮示例（"最近 30 天各行业工单数" → "只看已完成的" → "按数量从高到低排序"）每轮 IR 与 SQL 正确，`turn_index` 递增，第三轮仍带第一轮的默认口径标注；`AgentPredictor` 跑评测集中的多轮题时不再返回 `SKIPPED`。
 2. 澄清回答：选择选项、`accept_default`（有默认/无默认两种）、文字回答三条路径各有测试；实体澄清无默认时 `accept_default` 返回 `failed`。
 3. 口径调整：带 `DEFAULT_TIME_FIELD` 的结果返回"改为按完成时间统计"调整项，提交后新结果的时间字段改变且不再有该默认标注。
 4. 跨轮 release 变化：父查询使用的维度在新 release 中被删除时，续问返回"元数据已更新"。

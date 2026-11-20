@@ -18,12 +18,12 @@
 | --- | --- | --- |
 | F1 | 配置 | pydantic-settings，环境变量 + `.env` |
 | F2 | 日志与追踪 | JSON 结构化日志，请求级 `trace_id` 自动注入 |
-| F3 | API 骨架 | FastAPI 应用、`/healthz`、`/readyz`、统一错误响应 |
+| F3 | API 骨架 | FastAPI 应用、`/healthz`、`/readyz`、统一错误响应；业务路由统一前缀 `/api/v1`（架构第二十章） |
 | F4 | 系统库访问 | PostgreSQL，SQLAlchemy 2.0 + Alembic |
-| F5 | 业务库访问 | MySQL 只读连接，本期只用于连通检查 |
+| F5 | 业务库访问 | MySQL 只读连接（`t2s_ro`），只用于连通检查与元数据采集，不执行用户查询 |
 | F6 | 任务队列 | 基于 PostgreSQL 的 `FOR UPDATE SKIP LOCKED` 队列 + worker 循环 |
-| F7 | LangGraph 挂载点 | 一个空图，经 API 调用跑通输入到输出 |
-| F8 | 本地环境 | Docker Compose：PG 16、MySQL 5.7、MySQL 8.0 |
+| F7 | LangGraph 挂载点 | 一个空图，经临时接口 `POST /api/v1/agent/echo` 跑通输入到输出（Spec 08 删除） |
+| F8 | 本地环境 | Docker Compose：默认只起 PG 16、MySQL 5.7、MySQL 8.0；约定应用服务放在可选 profile `app` 中（服务本身由 Spec 09 加入） |
 | F9 | 测试分层 | 单元测试不依赖数据库；集成测试用 `integration` 标记 |
 
 ### 2.2 本期不做
@@ -32,6 +32,8 @@
 - 合成工单库的表结构与数据（Spec 03）
 - 鉴权、用户与租户（Spec 07）
 - 前端（Spec 09）
+- 用户查询的执行与租户账号（Spec 07 网关）
+- 应用镜像（Dockerfile）与 Compose 中的 `api`、`worker` 服务（Spec 09）
 - OpenTelemetry、Redis、Celery（架构文档 23.2 阶段 3）
 - GitHub Actions CI（gh 凭证尚无 workflow 权限，补上后单独加）
 
@@ -51,7 +53,7 @@ src/text2sql/
 │   ├── middleware.py      # F2 TraceIdMiddleware
 │   └── routes/
 │       ├── health.py      # F3 /healthz /readyz
-│       └── agent.py       # F7 /v1/agent/echo
+│       └── agent.py       # F7 /api/v1/agent/echo（临时，Spec 08 删除）
 ├── db/
 │   ├── system.py          # F4 PG engine / session
 │   ├── business.py        # F5 MySQL 只读 engine
@@ -84,12 +86,13 @@ tests/integration/ …
 | `log_level` | `T2S_LOG_LEVEL` | `str` | `"INFO"` |
 | `system_db_url` | `T2S_SYSTEM_DB_URL` | `SecretStr` | 无，必填 |
 | `business_db_url` | `T2S_BUSINESS_DB_URL` | `SecretStr` | 无，必填 |
-| `business_db_timeout_s` | `T2S_BUSINESS_DB_TIMEOUT_S` | `int` | `5` |
+| `business_db_timeout_s` | `T2S_BUSINESS_DB_TIMEOUT_S` | `int` | `5`（只作用于 `business_db_url` 连接，见 4.5） |
 | `job_poll_interval_s` | `T2S_JOB_POLL_INTERVAL_S` | `float` | `1.0` |
 | `job_lease_s` | `T2S_JOB_LEASE_S` | `int` | `300` |
 
 - `get_settings()` 用 `functools.lru_cache` 返回单例；测试通过清缓存覆盖。
 - 连接串用 `SecretStr`，日志与错误信息中永远不输出明文。
+- `business_db_url` 指向只读账号 `t2s_ro`（能看到全部租户的数据），只供元数据采集（Spec 02）与 `/readyz` 使用；用户查询使用 Spec 07 定义的租户连接串 `tenant_db_urls`，不使用本字段。
 - 仓库提供 `.env.example`，指向 Compose 中的本地库；`.env` 已在 `.gitignore`。
 
 ### 4.2 F2 日志与追踪
@@ -104,7 +107,7 @@ tests/integration/ …
 
 - `create_app() -> FastAPI` 组装中间件、路由和异常处理器。
 - `GET /healthz`：进程存活，始终返回 `200 {"status": "ok"}`，不访问数据库。
-- `GET /readyz`：分别对 PG 和 MySQL 执行 `SELECT 1`（各自超时 2 秒）。
+- `GET /readyz`：分别对 PG 和 MySQL（`business_db_url`，即 `t2s_ro`）执行 `SELECT 1`（各自超时 2 秒）。
   - 全部成功：`200 {"status": "ready", "checks": {"system_db": "ok", "business_db": "ok"}}`
   - 任一失败：`503`，失败项为 `"error"`，不返回异常详情。
 - 统一错误响应（所有非 2xx）：
@@ -115,6 +118,7 @@ tests/integration/ …
 
 - `AppError(code: str, message: str, status_code: int)` 为业务异常基类；未捕获异常统一返回 `500 INTERNAL_ERROR`，消息固定为 `"Internal server error"`，堆栈只进日志。
 - 请求校验失败返回 `422 VALIDATION_ERROR`。
+- 路径约定：`/healthz`、`/readyz` 不带前缀；其余所有 JSON API 路由挂在 `APIRouter(prefix="/api/v1")` 下（架构第二十章），后续 Spec 新增的 API 都使用该前缀。唯一例外是 Spec 09 的静态查询页面，挂载在 `/ui/`，不属于 API。
 
 ### 4.4 F4 系统库（PostgreSQL）
 
@@ -127,9 +131,10 @@ tests/integration/ …
 ### 4.5 F5 业务库（MySQL，只读）
 
 - 驱动 PyMySQL，URL 形如 `mysql+pymysql://…`。
-- `text2sql.db.business.get_business_engine()` 创建的连接在建立时执行 `SET SESSION TRANSACTION READ ONLY`，并设置连接与读取超时为 `business_db_timeout_s`。
+- `text2sql.db.business.get_business_engine()` 基于 `business_db_url` 创建 engine，连接在建立时执行 `SET SESSION TRANSACTION READ ONLY`，并把 PyMySQL 的 `connect_timeout` 与 `read_timeout` 设为 `business_db_timeout_s`。
+- `business_db_timeout_s` 的含义：`t2s_ro` 连接的建立与单条读取超时，用于连通检查和元数据采集（`information_schema` 查询）。它**不是**用户查询超时：网关的语句超时 `query_timeout_s`、EXPLAIN 超时 `explain_timeout_s` 以及租户连接的超时由 Spec 07 定义，与本字段相互独立。`/readyz` 另有固定 2 秒上限。
 - 本期只暴露 `ping() -> bool`（执行 `SELECT 1`）和 `server_version() -> str`（`SELECT VERSION()`）。完整的执行网关在 Spec 07。
-- 本地 Compose 中为 MySQL 创建只授予 `SELECT` 的账号 `t2s_ro`，应用默认使用该账号。
+- 本地 Compose 中为 MySQL 创建只授予 `SELECT` 的账号 `t2s_ro`。该账号只用于元数据采集与 `/readyz`；用户查询一律经 Spec 07 网关、使用按租户隔离的账号（`t2s_t{T}`，由 Spec 03 创建），网关永远不用 `t2s_ro` 执行用户 SQL。
 
 ### 4.6 F6 任务队列
 
@@ -158,7 +163,10 @@ def enqueue(session: Session, kind: str, payload: dict[str, Any], *,
             max_attempts: int = 3, run_after: datetime | None = None) -> int: ...
 def claim(session: Session, kinds: Sequence[str], lease_s: int) -> Job | None: ...
 def complete(session: Session, job_id: int) -> None: ...
-def fail(session: Session, job_id: int, error: str) -> None: ...
+def fail(session: Session, job_id: int, error: str, *, retryable: bool = True) -> None: ...
+
+class NonRetryableJobError(Exception):
+    """handler 抛出表示重试无意义（如参数错误、配置不匹配），任务直接置为 failed。"""
 ```
 
 语义：
@@ -166,19 +174,19 @@ def fail(session: Session, job_id: int, error: str) -> None: ...
 - `enqueue`：写入 `queued`，记录当前 `trace_id`。
 - `claim`：在一条语句中选出一条可执行任务并加锁，条件为 `kind` 匹配，且满足以下之一：`status = 'queued' AND run_after <= now()`，或 `status = 'running' AND locked_until < now()`（租约过期，视为 worker 崩溃）。按 `run_after, id` 排序，使用 `FOR UPDATE SKIP LOCKED LIMIT 1`；被选中的任务置为 `running`，`attempts += 1`，`locked_until = now() + lease_s`。
 - `complete`：置为 `succeeded`，清空 `locked_until`。
-- `fail`：若 `attempts < max_attempts`，置回 `queued`，`run_after = now() + 2^attempts 秒`（指数退避）；否则置为 `failed`。记录 `last_error`（截断到 2000 字符）。
+- `fail`：若 `retryable` 且 `attempts < max_attempts`，置回 `queued`，`run_after = now() + 2^attempts 秒`（指数退避）；否则置为 `failed`。记录 `last_error`（截断到 2000 字符）。
 
 `text2sql.jobs.worker`：
 
 - `register(kind: str)` 装饰器注册 handler，签名 `handler(payload: dict[str, Any]) -> None`。
-- `run_worker(stop_event: threading.Event)` 循环：领取任务，恢复 `trace_id`，调用 handler，成功则 `complete`，异常则 `fail`；无任务时休眠 `job_poll_interval_s`。收到 SIGINT / SIGTERM 时处理完当前任务后退出。
+- `run_worker(stop_event: threading.Event)` 循环：领取任务，恢复 `trace_id`，调用 handler，成功则 `complete`；handler 抛出 `NonRetryableJobError` 时 `fail(..., retryable=False)`，直接置为 `failed`，不论剩余次数；其他异常 `fail(...)`，按退避重试；无任务时休眠 `job_poll_interval_s`。收到 SIGINT / SIGTERM 时处理完当前任务后退出。
 - 本期注册一个内置 `kind = "noop"` 的 handler 用于测试。
 
 ### 4.7 F7 LangGraph 挂载点
 
 - `text2sql.agent.graph.build_graph()` 返回编译后的 `StateGraph`，State 为 `TypedDict`：`{"question": str, "answer": str}`，只有一个节点 `echo`，将 `question` 原样写入 `answer`。
-- `POST /v1/agent/echo`，请求 `{"question": "…"}`，响应 `{"answer": "…", "trace_id": "…"}`。
-- 该节点与接口仅用于验证挂载方式，Spec 08 会替换为真实工作流。
+- `POST /api/v1/agent/echo`，请求 `{"question": "…"}`，响应 `{"answer": "…", "trace_id": "…"}`。
+- 该节点与接口是临时的挂载检查，用于验证路由前缀、`trace_id` 与 LangGraph 调用方式；Spec 08 用真实工作流替换空图，并删除该接口及其测试（正式查询接口为 Spec 09 的 `POST /api/v1/query`）。
 
 ### 4.8 F8 本地环境
 
@@ -191,6 +199,8 @@ def fail(session: Session, job_id: int, error: str) -> None: ...
 | `mysql80` | `mysql:8.0` | 3308 | 业务库，8.0 方言 |
 
 - 每个服务配置 healthcheck；数据用命名卷持久化。
+- 本期 compose 只包含上表三个数据库服务，`docker compose -f deployment/compose.yaml up -d` 只起数据库，开发时 API 与 worker 在宿主机用 `uv run` 启动。
+- Profile 约定：应用服务（`api`、`worker`）统一放在 `profiles: [app]` 中，默认不启动，`--profile app` 时与数据库一起启动（架构第二十一章的 MVP 部署）。这两个服务与其镜像由 Spec 09 加入；本期不建 Dockerfile。
 - MySQL 初始化脚本放在 `deployment/mysql/init/`，创建库 `t2s_business` 和只读账号 `t2s_ro`（仅 `SELECT`）。本期库内只建一张 `_t2s_probe` 表用于连通测试，真实表结构由 Spec 03 提供。
 - `mysql:5.7` 官方镜像没有 arm64 版本，在 Apple Silicon 上为该服务设置 `platform: linux/amd64`（通过模拟运行，速度较慢，但只用于方言兼容测试）。
 - 账号密码只用于本地，写在 compose 与 `.env.example` 中，并在 README 中注明不得用于任何其他环境。
@@ -208,18 +218,29 @@ def fail(session: Session, job_id: int, error: str) -> None: ...
 3. 启动 API 后：`/healthz` 返回 200；`/readyz` 在 PG 和 MySQL（5.7 与 8.0 分别配置时）均可用时返回 200，停掉 MySQL 后返回 503。
 4. 任意请求的响应头都带 `X-Trace-Id`；传入合法 `X-Trace-Id` 时原样返回；该请求的所有日志行带同一 `trace_id`。
 5. 未捕获异常返回统一错误结构，响应中不含堆栈和连接串。
-6. 使用 `t2s_ro` 账号对业务库执行写操作会失败（权限与只读会话双重保证），有集成测试覆盖。
-7. 队列并发测试：入队 200 个 `noop` 任务，4 个线程并发领取，每个任务恰好执行一次；handler 抛异常的任务按退避重试，达到 `max_attempts` 后为 `failed`；租约过期的 `running` 任务可被重新领取。
-8. `POST /v1/agent/echo` 返回与输入相同的 `answer`。
+6. 使用 `t2s_ro` 账号对业务库执行写操作会失败（权限与只读会话双重保证），有集成测试覆盖；`get_business_engine()` 建立的连接上 PyMySQL `connect_timeout`、`read_timeout` 等于 `business_db_timeout_s`（单元测试检查连接参数）。
+7. 队列并发测试：入队 200 个 `noop` 任务，4 个线程并发领取，每个任务恰好执行一次；handler 抛异常的任务按退避重试，达到 `max_attempts` 后为 `failed`；handler 抛 `NonRetryableJobError` 的任务第一次失败即为 `failed`（`attempts = 1`）；租约过期的 `running` 任务可被重新领取。
+8. `POST /api/v1/agent/echo` 返回与输入相同的 `answer`；`POST /v1/agent/echo`（无前缀）返回 404。
 9. `uv run ruff check .`、`uv run ruff format --check .`、`uv run mypy`、`uv run pytest`、`uv run pytest -m integration` 全部通过。
 10. `AGENTS.md` 与 README 补充：如何启动 Compose、运行迁移、启动 API 和 worker、运行集成测试。
 
 ## 6. 新增依赖
 
-- 运行时：`sqlalchemy`、`alembic`（其余 fastapi、uvicorn、langgraph、psycopg、pymysql、pydantic-settings 已在 `pyproject.toml`）
-- 开发：`httpx`（FastAPI TestClient 所需）
+- 运行时：`sqlalchemy`、`alembic`、`httpx`（其余 fastapi、uvicorn、langgraph、psycopg、pymysql、pydantic-settings 已在 `pyproject.toml`）。`httpx` 本期供 FastAPI TestClient 使用，Spec 08 的 LLM 适配器在运行时使用它，因此直接列为运行时依赖，不放开发依赖组。
+- 开发：无新增
 
 ## 7. 风险与说明
 
 - MySQL 5.7 在 Apple Silicon 上通过 amd64 模拟运行，启动和查询较慢；如影响开发体验，可在日常开发中只起 `mysql80`，5.7 留给方言测试。
 - 队列选择 PostgreSQL 而非 Redis / Celery，依据架构文档 23.2：MVP 吞吐量低，减少组件；队列接口独立封装，后续替换不影响调用方。
+
+## 8. 修订记录
+
+| 日期 | 修改 | 原因 |
+| --- | --- | --- |
+| 2026-11-20 | 业务路由统一前缀 `/api/v1`；echo 接口改为 `POST /api/v1/agent/echo`，明确为临时挂载检查、由 Spec 08 删除 | 与架构第二十章及 Spec 08/09 的接口路径一致 |
+| 2026-11-20 | `t2s_ro` 只用于元数据采集与 `/readyz`，用户查询使用 Spec 07 的租户账号 | 原文"应用默认使用该账号"与 Spec 07 的租户隔离冲突（`t2s_ro` 能看全部租户） |
+| 2026-11-20 | 队列增加 `NonRetryableJobError` 与 `fail(..., retryable=False)` | Spec 02 起的 handler 需要"不重试、直接失败"的语义，统一在本 Spec 定义 |
+| 2026-11-20 | `httpx` 从开发依赖改为运行时依赖 | Spec 08 的 LLM 适配器在运行时使用 |
+| 2026-11-20 | 明确 `business_db_timeout_s` 只是 `t2s_ro` 连接的建立/读取超时 | 与 Spec 07 的查询超时、EXPLAIN 超时区分，避免混用 |
+| 2026-11-20 | Compose 默认只起数据库；约定 `api`、`worker` 放在可选 profile `app`，由 Spec 09 加入 | 与架构第二十一章 MVP 部署及 Spec 09 D6 一致 |

@@ -437,7 +437,7 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 - `datasource_id` 必须等于 `Settings.datasource_id`。`release_id` 为空时取活跃 release（查询全程固定）；评测可指定候选 release。`initial_ir` 非空时跳过检索与理解，直接从实体解析/规划开始（Spec 09 的续问与澄清回答使用）。
 - 状态与 HTTP 无关；Spec 09 负责映射为 API 响应。
 - CLI：`uv run python -m text2sql.agent ask "问题" --user U [--as-of 2026-06-30] [--dry-run]`，以 `principal` 表中该用户身份执行，打印 SQL、结果前 20 行、口径、警告与 `trace_id`。
-- 删除 Spec 01 的 `echo` 节点与 `POST /v1/agent/echo` 及其测试。
+- 删除 Spec 01 的 `echo` 节点与临时接口 `POST /api/v1/agent/echo` 及其测试（Spec 01 4.7 约定由本 Spec 删除）。
 - `AgentPredictor`（`name = "agent"`）：用 `Principal(principal_id=0, user_id="eval", tenant_id=题目租户, role="analyst")` 调 `run_query(as_of=题目 as_of, release_id=运行的 release)`；`completed` → `ANSWER`（带结果，Runner 不再执行 SQL）；`needs_clarification` → `CLARIFY`（带澄清类型）；`rejected` → `REJECT`；`failed` → `ERROR`。多轮题在 Spec 09 提供续问前返回 `SKIPPED`。
 
 ### 4.15 自然语言类绕过用例（Spec 07 G8 的 `kind: nl`）
@@ -464,7 +464,7 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 
 ## 6. 新增依赖
 
-- 运行时：`httpx`（Spec 01 中为开发依赖，本 Spec 移到运行时依赖）
+- 无（`httpx` 已由 Spec 01 列为运行时依赖）
 
 ## 7. 风险与说明
 

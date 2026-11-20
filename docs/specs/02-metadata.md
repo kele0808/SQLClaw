@@ -408,7 +408,7 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 | `release activate ID --by NAME --reason TEXT` | 不带门禁的激活（prod 环境拒绝） |
 | `release show [ID\|active]` | 打印 release 组件与状态 |
 
-队列：`@register("metadata.sync")`，payload `{"datasource_id": str, "requested_by": str}`；`datasource_id` 必须等于当前进程的 `Settings.datasource_id`，否则任务失败（不重试，直接 `failed`：通过抛出 `NonRetryableJobError`，见第 7 节）。
+队列：`@register("metadata.sync")`，payload `{"datasource_id": str, "requested_by": str}`；`datasource_id` 必须等于当前进程的 `Settings.datasource_id`，否则任务失败（不重试，直接 `failed`：handler 抛出 Spec 01 F6 定义的 `NonRetryableJobError`）。
 
 日志：采集开始、结束各一条，字段含 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`、`trace_id`。
 
@@ -433,7 +433,7 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 
 ## 7. 风险与说明
 
-- **对 Spec 01 的小扩展**：队列 handler 需要区分"不应重试"的错误。本 Spec 在 `text2sql.jobs.queue` 增加 `NonRetryableJobError`：worker 捕获后直接置 `failed`，不做退避重试。这是对 Spec 01 F6 的增补，实现时同步修改 Spec 01 的说明。
+- **不可重试的任务失败**：参数或配置不匹配（如 `datasource_id` 不一致）重试无意义，handler 抛出 Spec 01 F6 的 `text2sql.jobs.queue.NonRetryableJobError`，worker 直接置 `failed`。本 Spec 不修改队列。
 - **采集账号权限**：`t2s_ro` 只有 `SELECT`，看不到视图定义（需 `SHOW VIEW`）。MVP 合成库不在业务库内放视图，不受影响；真实库若视图承载业务逻辑（架构 17.3），需要 DBA 授予 `SHOW VIEW`（开放决策，见下）。
 - **`TABLE_ROWS` 仅为估计值**，InnoDB 上误差可能很大，只用于展示和成本提示，不进入任何正确性判断。
 - **快照去重的副作用**：结构不变时沿用旧快照，`row_estimate` 也停在旧值。阶段 2 引入 Data Profiling 时单独存储统计信息。
