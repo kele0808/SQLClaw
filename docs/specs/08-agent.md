@@ -1,6 +1,6 @@
 # Spec 08：Agent 编排（LangGraph 全链路）
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：第十二章（12.1～12.3）、8.4/8.5（Schema 摘要 + 关键词检索，阶段 A）、9.4（兜底通道）、9.6（歧义评分与澄清）、第十三章（修复）、第十四章（结果校验与血缘）、11.6（Prompt 注入与上下文最小化）、2.1（信任边界）、3（模型接入层可替换）、第二十三章（第 5 周）
 - 依赖：Spec 01（LangGraph 挂载点、`trace_id`、队列）、Spec 02（release 指针、`StaleSet`、`mark_stale`、`comment_visible`）、Spec 03（`Predictor`、`Prediction`）、Spec 04（`connect_tables`）、Spec 05（`ReleaseBundle`、术语、实体查找维度、`build_candidate_release`）、Spec 06（`QueryIR`、`compile_ir`、`PlanError`、`IREditOp`、`Assumption`、`MetricLineage`）、Spec 07（`Gateway`、`Principal`、`GatewayError`、`ErrorCategory`）

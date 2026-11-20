@@ -1,6 +1,6 @@
 # Spec 02：Metadata 元数据目录
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：`docs/architecture.md` 第四章（4.1～4.3）、5.1/5.3/5.5 的 MVP 修订、2.1（信任边界）、11.6（元数据清洗）、16.2（漂移）、第十九章（版本记录）、第二十三章（第 1 周）
 - 依赖：Spec 01（Settings、`session_scope()`、`get_business_engine()`、`jobs` 队列、Alembic、`trace_id`）

@@ -1,6 +1,6 @@
 # Spec 07：SQL 校验与安全执行网关
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：10.2（AST）、10.3（语义校验：边、扇出）、10.4（成本，禁止 EXPLAIN ANALYZE）、第十一章（11.1～11.6）、13.1（错误分类）、2.1（错误信息净化）、16.2（执行期漂移）、第二十三章（第 4 周）
 - 依赖：Spec 01（Settings、`AppError`、`trace_id`、`session_scope`）、Spec 02（快照、`StaleSet`）、Spec 03（租户视图库与账号、合成库）、Spec 04（`JoinGraph.find_edge_by_columns`、`JoinStep`）、Spec 05（`ReleaseBundle`、字段敏感级别、租户键）、Spec 06（能力矩阵 `capability_violations`、编译产物作为正向用例）

@@ -1,6 +1,6 @@
 # Spec 09：Delivery 多轮对话、Schema Diff 与发布、公开 API、查询页面
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：17.5（多轮对话）、9.6（口径标注上的修改）、5.1/5.2/5.5/16.1/16.2 的 MVP 修订（手动 Diff、STALE、发布与回滚、门禁）、第二十章（API）、第二十一章（MVP 部署）、22.2（MVP 验收）、第二十三章（第 6 周）
 - 依赖：Spec 01（API 骨架、队列、Compose）、Spec 02（快照、身份、release 与指针、`move_pointer`、STALE）、Spec 03（评测运行与判定）、Spec 04/05（依赖关系、`build_candidate_release`）、Spec 06（`IREditOp`、`apply_edits`）、Spec 07（鉴权、审计）、Spec 08（`run_query`、`QueryResponse`、`Clarification`、`query_execution`、LLM 接口）

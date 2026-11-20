@@ -1,6 +1,6 @@
 # Spec 06：Query IR v2、规划器与版本感知 SQL 编译器
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：第九章（9.1、9.1.1、9.2、9.3、9.5、9.6 的默认口径部分）、10.1（版本能力矩阵）、10.3（扇出 / 比率 / 边校验在编译期的落实）、6.5（预聚合）、14.3（结果血缘）、17.5（IR 增量修改）、17.6（编译缓存）、第二十三章（第 3 周、第 5 周）
 - 依赖：Spec 02（`StaleSet`、对象键）、Spec 03（验收集 `expected_ir`、标注约定、`Predictor` 协议）、Spec 04（`JoinGraph`、`JoinStep`、`tree_from_edges`、`connect_tables`）、Spec 05（`ReleaseBundle`、`SemanticModel`）

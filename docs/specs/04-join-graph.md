@@ -1,6 +1,6 @@
 # Spec 04：Join Graph 关联图
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：第六章（6.2～6.6 及修订）、10.3（Edge / Fan-out Validation）、1.4（Join 关系确认人）、第二十三章（第 2 周）
 - 依赖：Spec 01、Spec 02（`SchemaSnapshot`、`metadata_release`、`StaleSet`、对象键）、Spec 03（合成库与 `required_tables`，用于验收）

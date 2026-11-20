@@ -1,6 +1,6 @@
 # Spec 05：Semantic Layer 语义层
 
-- 状态：待审阅
+- 状态：已确认（2026-11-20）
 - 日期：2026-11-20
 - 对应架构文档：第七章（7.1～7.4 及修订）、9.6（默认口径）、11.5（敏感字段清单）、1.4（指标定义人与审核人）、5.5（Release 组成）、第二十三章（第 3 周）
 - 依赖：Spec 01、Spec 02（快照、release、`StaleSet`）、Spec 04（边 ID、`tree_from_edges`、`JoinGraph`、`semantic_dir`）
