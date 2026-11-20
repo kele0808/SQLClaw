@@ -14,6 +14,15 @@ A production-grade Text2SQL Agent: users ask questions in natural language (most
 - `docs/spec-original.md` — the original spec, kept for reference only. Do not implement from it where it conflicts with `architecture.md`.
 - If code and the spec disagree, stop and flag it rather than silently picking one. If you change a design decision, update `docs/architecture.md` in the same change.
 
+## Spec-driven development
+
+All work is split into sub-project specs under `docs/specs/` (01 foundation, 02 metadata, 03 eval, 04 join-graph, 05 semantic, 06 ir-compiler, 07 gateway, 08 agent, 09 delivery), each with an implementation plan under `docs/plans/`.
+
+- Only implement against a spec whose status is **已确认 (approved)**. Do not start a sub-project whose spec is still a draft.
+- Build only what the spec lists. Items in a spec's "本期不做" section are out of scope even if they look easy.
+- If implementation shows the spec is wrong or incomplete, stop and update the spec first (and get it re-approved), then the code.
+- Each PR names the spec and the acceptance criteria it covers.
+
 ## Tech stack
 
 - Python, FastAPI (API), LangGraph (agent orchestration), SQLGlot (SQL parsing / validation / generation)
