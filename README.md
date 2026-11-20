@@ -46,6 +46,7 @@ MVP 之后分三个阶段：稳定与扩展（第 7～10 周）、规模化（�
 
 - [架构方案（修订版）](docs/architecture.md)：当前以此为准，含审阅修订说明。
 - [原始方案](docs/spec-original.md)：修订前的原文，保留作对照。
+- [AGENTS.md](AGENTS.md)：给 AI 编码助手的项目约定（`CLAUDE.md` 引用同一份）。
 
 ## 规划中的目录结构
 
