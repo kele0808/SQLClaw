@@ -41,7 +41,24 @@ Only create directories when the module is actually being built; the MVP deliber
 
 - Every validator or security rule ships with tests, including bypass attempts. The security bypass suite (`tests/security/`) must pass in CI.
 - Behaviour changes to understanding, planning, or SQL generation must be checked against the evaluation set (starting with the 50-question acceptance set in chapter 22), comparing execution results rather than SQL text.
-- Build, lint, and test commands will be documented here once `pyproject.toml` exists. Until then, do not assume a specific toolchain; propose one in the PR.
+
+## Environment and commands
+
+- Python **3.12** (pinned in `.python-version`; `requires-python = ">=3.12,<3.13"`).
+- Dependencies and the virtualenv are managed with **uv**. Do not use pip, conda, or Poetry, and do not edit `uv.lock` by hand.
+- Package code lives in `src/text2sql/` (src layout). The module paths in `docs/architecture.md` chapter 18 (`src/agent/`, `src/planner/`, ...) map to `src/text2sql/agent/`, `src/text2sql/planner/`, and so on.
+
+```bash
+uv sync                      # create .venv and install all deps (incl. dev)
+uv add <pkg>                 # add a runtime dependency
+uv add --dev <pkg>           # add a dev dependency
+uv run ruff check .          # lint
+uv run ruff format .         # format (use --check in CI)
+uv run mypy                  # type check (strict, src + tests)
+uv run pytest                # run tests
+```
+
+Before finishing a change, run `uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest` and make sure all four pass.
 
 ## Conventions
 

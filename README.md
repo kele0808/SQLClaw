@@ -42,6 +42,17 @@
 
 MVP 之后分三个阶段：稳定与扩展（第 7～10 周）、规模化（第 11～16 周）、平台化（第 16 周以后）。详见架构文档第二十三章。
 
+## 本地开发
+
+需要 Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
+
+```bash
+uv sync                # 创建 .venv 并安装依赖
+uv run pytest          # 运行测试
+uv run ruff check .    # 代码检查
+uv run mypy            # 类型检查
+```
+
 ## 文档
 
 - [架构方案（修订版）](docs/architecture.md)：当前以此为准，含审阅修订说明。
