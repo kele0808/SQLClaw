@@ -6,7 +6,7 @@ Guidance for AI coding agents (Cursor, Codex, Claude Code, etc.) working in this
 
 A production-grade Text2SQL Agent: users ask questions in natural language (mostly Chinese); the system understands business semantics, plans a query, generates and validates SQL, executes it safely, and returns traceable results.
 
-**Status: design stage.** There is no application code yet. Code will be added following the 6-week MVP plan in `docs/architecture.md` (chapter 23).
+**Status: Spec 01 (foundation) implemented.** Config, logging/trace ids, the API skeleton, system and read-only business DB access, the PostgreSQL job queue and worker, and a temporary LangGraph echo route exist. Further code follows the 6-week MVP plan in `docs/architecture.md` (chapter 23) and the sub-project specs.
 
 ## Source of truth
 
@@ -51,6 +51,14 @@ Only create directories when the module is actually being built; the MVP deliber
 
 - Every validator or security rule ships with tests, including bypass attempts. The security bypass suite (`tests/security/`) must pass in CI.
 - Behaviour changes to understanding, planning, or SQL generation must be checked against the evaluation set (starting with the 50-question acceptance set in chapter 22), comparing execution results rather than SQL text.
+- Commands (Python 3.12 via uv; add dependencies only with `uv add`):
+  - Lint/format/types: `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`
+  - Unit tests (no databases): `uv run pytest`
+  - Local databases: `docker compose -f deployment/compose.yaml up -d` (app services live under `--profile app`, added by Spec 09)
+  - Migrations: `uv run alembic upgrade head`
+  - API: `uv run uvicorn apps.api.main:app --no-access-log`; worker: `uv run python -m text2sql.jobs.worker`
+  - Integration tests: `set -a && source .env && set +a && uv run pytest -m integration` (tests skip when `T2S_TEST_*` URLs are unset)
+- The business MySQL account `t2s_ro` (`T2S_BUSINESS_DB_URL`) is only for metadata collection and `/readyz`; never execute user SQL with it.
 
 ## Environment and commands
 

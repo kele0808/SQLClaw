@@ -70,3 +70,26 @@ docs/        # 架构与设计文档
 ```
 
 完整结构见架构文档第十八章。
+
+## 本地开发
+
+> 下面所有账号密码只用于本机 Docker Compose，**不得用于任何其他环境**。
+
+1. 准备配置：`cp .env.example .env`
+2. 启动数据库（PostgreSQL 16、MySQL 5.7、MySQL 8.0）：
+   ```bash
+   docker compose -f deployment/compose.yaml up -d
+   docker compose -f deployment/compose.yaml ps   # 三个服务都应为 (healthy)
+   ```
+   PostgreSQL 映射到宿主机 **5433**（容器内仍为 5432），MySQL 5.7 为 3307，MySQL 8.0 为 3308。
+   Apple Silicon 上 MySQL 5.7 以 amd64 模拟运行，首次启动较慢；日常开发可只起 `pg mysql80`。
+   应用服务（`api`、`worker`）将由 Spec 09 放在 profile `app` 中，本期只起数据库。
+3. 运行迁移：`uv run alembic upgrade head`（回滚：`uv run alembic downgrade base`）
+4. 启动 API：`uv run uvicorn apps.api.main:app --no-access-log`，检查 `curl -i localhost:8000/healthz` 与 `curl -i localhost:8000/readyz`
+5. 启动 worker：`uv run python -m text2sql.jobs.worker`（Ctrl-C 处理完当前任务后退出）
+6. 测试：
+   ```bash
+   uv run pytest                                          # 单元测试（不需要数据库）
+   set -a && source .env && set +a && uv run pytest -m integration   # 集成测试（需要 Compose）
+   ```
+   集成测试读取 `T2S_TEST_SYSTEM_DB_URL`、`T2S_TEST_MYSQL57_URL`、`T2S_TEST_MYSQL80_URL`，未设置时自动跳过。
