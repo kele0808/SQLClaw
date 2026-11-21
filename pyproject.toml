@@ -5,12 +5,15 @@ description = "Production-grade Text2SQL Agent (LangGraph + FastAPI + SQLGlot)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "alembic>=1.20.1",
     "fastapi",
+    "httpx>=0.28.1",
     "langgraph",
     "psycopg[binary]",
     "pydantic-settings",
     "pymysql",
     "pyyaml",
+    "sqlalchemy>=2.0",
     "sqlglot",
     "uvicorn[standard]",
 ]
@@ -41,7 +44,10 @@ files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+markers = [
+    "integration: requires the Docker Compose databases (deployment/compose.yaml)",
+]
+addopts = "-ra --strict-markers -m 'not integration'"
 
 [dependency-groups]
 dev = [
