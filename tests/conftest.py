@@ -11,10 +11,15 @@ UNIT_SYSTEM_DB_URL = "postgresql+psycopg://unit:unit@127.0.0.1:1/unit"
 UNIT_BUSINESS_DB_URL = "mysql+pymysql://unit:unit@127.0.0.1:1/unit"
 
 
+# Capture the real cached functions at import time: tests may monkeypatch
+# `system.get_sessionmaker` with a plain lambda, and this fixture's teardown
+# runs before monkeypatch restores the original.
+_CACHED_FUNCS = (get_settings, system.get_engine, system.get_sessionmaker)
+
+
 def _clear_caches() -> None:
-    get_settings.cache_clear()
-    system.get_engine.cache_clear()
-    system.get_sessionmaker.cache_clear()
+    for func in _CACHED_FUNCS:
+        func.cache_clear()
 
 
 @pytest.fixture(autouse=True)
