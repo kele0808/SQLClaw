@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from text2sql.common.config import get_settings
-from text2sql.db import system
+from text2sql.db import business, system
 
 UNIT_SYSTEM_DB_URL = "postgresql+psycopg://unit:unit@127.0.0.1:1/unit"
 UNIT_BUSINESS_DB_URL = "mysql+pymysql://unit:unit@127.0.0.1:1/unit"
@@ -14,7 +14,12 @@ UNIT_BUSINESS_DB_URL = "mysql+pymysql://unit:unit@127.0.0.1:1/unit"
 # Capture the real cached functions at import time: tests may monkeypatch
 # `system.get_sessionmaker` with a plain lambda, and this fixture's teardown
 # runs before monkeypatch restores the original.
-_CACHED_FUNCS = (get_settings, system.get_engine, system.get_sessionmaker)
+_CACHED_FUNCS = (
+    get_settings,
+    system.get_engine,
+    system.get_sessionmaker,
+    business.get_business_engine,
+)
 
 
 def _clear_caches() -> None:
