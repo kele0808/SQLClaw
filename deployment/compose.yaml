@@ -1,0 +1,63 @@
+# Local development databases. Credentials are for this machine only.
+# Profile convention (Spec 01 4.8): application services `api` and `worker`
+# are added by Spec 09 under `profiles: [app]`; a plain
+# `docker compose -f deployment/compose.yaml up -d` starts databases only.
+name: text2sql
+
+services:
+  pg:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: t2s
+      POSTGRES_PASSWORD: t2s_local_only
+      POSTGRES_DB: t2s_system
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U t2s -d t2s_system"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mysql57:
+    image: mysql:5.7
+    platform: linux/amd64  # no arm64 image exists; emulated on Apple Silicon
+    environment:
+      MYSQL_ROOT_PASSWORD: root_local_only
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql57_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  mysql80:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_local_only
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql80_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  pg_data:
+  mysql57_data:
+  mysql80_data:
