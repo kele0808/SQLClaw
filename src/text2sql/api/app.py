@@ -5,7 +5,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from text2sql import __version__
 from text2sql.api.middleware import TraceIdMiddleware
-from text2sql.api.routes import health
+from text2sql.api.routes import agent, health
 from text2sql.common.errors import (
     HTTP_ERROR,
     METHOD_NOT_ALLOWED,
@@ -42,7 +42,9 @@ async def _handle_validation_error(request: Request, exc: Exception) -> JSONResp
 
 
 def build_api_v1_router() -> APIRouter:
-    return APIRouter(prefix=API_V1_PREFIX)
+    router = APIRouter(prefix=API_V1_PREFIX)
+    router.include_router(agent.router)
+    return router
 
 
 def create_app() -> FastAPI:
