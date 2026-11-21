@@ -25,7 +25,7 @@
 - `jobs` table columns exactly as spec 4.6, statuses `queued`/`running`/`succeeded`/`failed`, index `(status, run_after)`; queue API exactly `enqueue`, `claim`, `complete`, `fail(..., *, retryable: bool = True)`, `NonRetryableJobError`; backoff `2^attempts` seconds; `last_error` truncated to 2000 characters.
 - Worker: `register(kind)` decorator, handler `handler(payload: dict[str, Any]) -> None`; `run_worker(stop_event: threading.Event)`; built-in `noop`; started with `python -m text2sql.jobs.worker`; SIGINT/SIGTERM finish the current job then exit.
 - LangGraph mount check: `build_graph()` with single node `echo`; `POST /api/v1/agent/echo` (temporary; Spec 08 deletes it).
-- Compose: `pg` (`pgvector/pgvector:pg16`, host 5432), `mysql57` (`mysql:5.7`, host 3307, `platform: linux/amd64`), `mysql80` (`mysql:8.0`, host 3308); healthchecks; named volumes; databases only by default; `api`/`worker` reserved for `profiles: [app]`, added by Spec 09 (no Dockerfile here).
+- Compose: `pg` (`pgvector/pgvector:pg16`, host 5433), `mysql57` (`mysql:5.7`, host 3307, `platform: linux/amd64`), `mysql80` (`mysql:8.0`, host 3308); healthchecks; named volumes; databases only by default; `api`/`worker` reserved for `profiles: [app]`, added by Spec 09 (no Dockerfile here).
 - MySQL init in `deployment/mysql/init/`: database `t2s_business`, account `t2s_ro` with `SELECT` only, table `_t2s_probe`.
 - Local credentials appear only in compose and `.env.example`; README states they must not be used anywhere else.
 - Tests: marker `integration`; `uv run pytest` = unit only; `uv run pytest -m integration` = integration; integration tests read `T2S_TEST_SYSTEM_DB_URL`, `T2S_TEST_MYSQL57_URL`, `T2S_TEST_MYSQL80_URL` and skip (not fail) when unset; separate test database; clean data before and after each test.
@@ -911,7 +911,7 @@ git commit -m "feat(api): add app factory, trace id middleware, unified errors a
 **Interfaces:**
 - Consumes: `get_settings` (Task 1).
 - Produces:
-  - Compose services `pg` (5432; databases `t2s_system` and `t2s_test`; user `t2s`), `mysql57` (3307), `mysql80` (3308); MySQL database `t2s_business` with table `_t2s_probe(id, note)` holding one row `(1, 'probe')`; account `t2s_ro` with `SELECT ON t2s_business.*` only
+  - Compose services `pg` (5433; databases `t2s_system` and `t2s_test`; user `t2s`), `mysql57` (3307), `mysql80` (3308); MySQL database `t2s_business` with table `_t2s_probe(id, note)` holding one row `(1, 'probe')`; account `t2s_ro` with `SELECT ON t2s_business.*` only
   - `tests/integration/conftest.py`: `require_env(name: str) -> str` (skips with reason `"<NAME> not set"`); `MYSQL_TARGETS = {"mysql57": "T2S_TEST_MYSQL57_URL", "mysql80": "T2S_TEST_MYSQL80_URL"}`; fixtures `system_db_url() -> str` (copies `T2S_TEST_SYSTEM_DB_URL` into `T2S_SYSTEM_DB_URL`, clears settings cache), `mysql_target() -> str` (parametrized `mysql57`/`mysql80`), `mysql_url(mysql_target) -> str` (copies the matching URL into `T2S_BUSINESS_DB_URL`, clears settings cache)
 
 - [ ] **Step 1: Write the Compose file**
@@ -933,7 +933,7 @@ services:
       POSTGRES_PASSWORD: t2s_local_only
       POSTGRES_DB: t2s_system
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
@@ -1025,7 +1025,7 @@ Create `.env.example`:
 # Local development only. Never reuse these credentials anywhere else.
 T2S_ENV=dev
 T2S_LOG_LEVEL=INFO
-T2S_SYSTEM_DB_URL=postgresql+psycopg://t2s:t2s_local_only@127.0.0.1:5432/t2s_system
+T2S_SYSTEM_DB_URL=postgresql+psycopg://t2s:t2s_local_only@127.0.0.1:5433/t2s_system
 T2S_BUSINESS_DB_URL=mysql+pymysql://t2s_ro:t2s_ro_local_only@127.0.0.1:3308/t2s_business
 T2S_BUSINESS_DB_TIMEOUT_S=5
 T2S_JOB_POLL_INTERVAL_S=1.0
@@ -1033,7 +1033,7 @@ T2S_JOB_LEASE_S=300
 
 # Integration tests read these from the process environment, not from .env:
 #   set -a && source .env && set +a && uv run pytest -m integration
-T2S_TEST_SYSTEM_DB_URL=postgresql+psycopg://t2s:t2s_local_only@127.0.0.1:5432/t2s_test
+T2S_TEST_SYSTEM_DB_URL=postgresql+psycopg://t2s:t2s_local_only@127.0.0.1:5433/t2s_test
 T2S_TEST_MYSQL57_URL=mysql+pymysql://t2s_ro:t2s_ro_local_only@127.0.0.1:3307/t2s_business
 T2S_TEST_MYSQL80_URL=mysql+pymysql://t2s_ro:t2s_ro_local_only@127.0.0.1:3308/t2s_business
 ```
@@ -1045,7 +1045,7 @@ Expected: prints `.env`. If it prints nothing, append `.env` to `.gitignore` and
 
 Run: `cp -n .env.example .env; docker compose -f deployment/compose.yaml up -d`
 Then run: `docker compose -f deployment/compose.yaml ps`
-Expected: within ~2 minutes (5.7 is slower under emulation) `pg`, `mysql57`, `mysql80` all show `Up … (healthy)`. If port 5432 is taken by a local PostgreSQL, stop it rather than changing the spec's port.
+Expected: within ~2 minutes (5.7 is slower under emulation) `pg`, `mysql57`, `mysql80` all show `Up … (healthy)`. The host port is 5433 (5432 is often taken by other local PostgreSQL instances); containers still listen on 5432 internally.
 
 - [ ] **Step 5: Write the integration fixtures**
 

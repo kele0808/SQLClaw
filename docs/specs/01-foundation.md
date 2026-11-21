@@ -194,7 +194,7 @@ class NonRetryableJobError(Exception):
 
 | 服务 | 镜像 | 宿主端口 | 用途 |
 | --- | --- | --- | --- |
-| `pg` | `pgvector/pgvector:pg16` | 5432 | 系统库（预装 pgvector，供后续 spec 使用） |
+| `pg` | `pgvector/pgvector:pg16` | 5433 | 系统库（预装 pgvector，供后续 spec 使用） |
 | `mysql57` | `mysql:5.7` | 3307 | 业务库，5.7 方言 |
 | `mysql80` | `mysql:8.0` | 3308 | 业务库，8.0 方言 |
 
@@ -244,3 +244,4 @@ class NonRetryableJobError(Exception):
 | 2026-11-20 | `httpx` 从开发依赖改为运行时依赖 | Spec 08 的 LLM 适配器在运行时使用 |
 | 2026-11-20 | 明确 `business_db_timeout_s` 只是 `t2s_ro` 连接的建立/读取超时 | 与 Spec 07 的查询超时、EXPLAIN 超时区分，避免混用 |
 | 2026-11-20 | Compose 默认只起数据库；约定 `api`、`worker` 放在可选 profile `app`，由 Spec 09 加入 | 与架构第二十一章 MVP 部署及 Spec 09 D6 一致 |
+| 2026-11-21 | 本地 `pg` 宿主机端口由 5432 改为 5433（容器内仍为 5432） | 开发机上 5432 常被其他项目的 PostgreSQL 占用 |
