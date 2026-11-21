@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from text2sql.common.config import get_settings
+from text2sql.db import system
 
 UNIT_SYSTEM_DB_URL = "postgresql+psycopg://unit:unit@127.0.0.1:1/unit"
 UNIT_BUSINESS_DB_URL = "mysql+pymysql://unit:unit@127.0.0.1:1/unit"
@@ -12,6 +13,8 @@ UNIT_BUSINESS_DB_URL = "mysql+pymysql://unit:unit@127.0.0.1:1/unit"
 
 def _clear_caches() -> None:
     get_settings.cache_clear()
+    system.get_engine.cache_clear()
+    system.get_sessionmaker.cache_clear()
 
 
 @pytest.fixture(autouse=True)
