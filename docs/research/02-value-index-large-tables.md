@@ -87,7 +87,8 @@
 
 ## 3. 采纳的规则（spec 02 §4.11）
 
-1. 小表（`row_estimate ≤ value_index_max_rows`）：规则和 SQL 不变（除了下面第 4 条），直接执行。
+0. 行数估计在构建时现读：规划前在 `t2s_ro` 上查一次 `SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'`（8.0 先 `SET SESSION information_schema_stats_expiry = 0`）。非 NULL 的现读值代替快照的 `row_estimate`，NULL 回退快照值，快照里有、现读结果里没有的基表记 `TABLE_GONE`（快照之后被删除）。
+1. 小表（行数估计 `≤ value_index_max_rows`）：规则和 SQL 不变（除了下面第 4 条），直接执行。
 2. 大表：先过完其他所有规则；最后检查是否有 BTREE 索引，前导列依次是 `(租户列, 本列)`（关闭租户规则时本列是第一列），且是整列索引。没有就记 `BIG_TABLE_NO_INDEX`。include 不能放宽它。
 3. 大表的列，执行前先 `EXPLAIN FORMAT=TRADITIONAL` 同一条 SQL，`Extra` 含 `Using index for group-by` 才执行，否则记 `NO_LOOSE_SCAN`。
 4. 采集 SQL 的 `DISTINCT` 只放裸列：`DISTINCT tenant_id AS tenant_key, col AS value`，或关闭租户规则时的 `DISTINCT col AS value`；租户键在 Python 里转字符串。
@@ -106,7 +107,10 @@
 ## 5. 未验证 / 局限
 
 - `WHERE` 过滤不影响松散扫描：只在本机 10 万行临时表 / 测试表上验证过，真实库的数据分布和统计信息不同，优化器可能选别的计划（`EXPLAIN` 门槛兜底）。
-- `row_estimate` 来自快照：结构不变时沿用旧快照的值，8.0 还有统计缓存，可能过时。表在两次快照之间变大时，这次仍按普通表执行，单条查询会被 `MAX_EXECUTION_TIME` 截断成 `TIMEOUT`（spec 02 §4.11）。
+- 行数估计不再取快照的值（结构不变时快照沿用旧值），而是构建时现读 `TABLE_ROWS`（spec 02 §4.11「构建时现读行数」）。
+  - 8.0 的 `information_schema_stats_expiry` 默认 86400 秒，`TABLE_ROWS` 最多可能是一天前的缓存。2026-11-22 在本机 8.0.46 实测：空表由 root 插入 10 万行、不 `ANALYZE`，`t2s_ro` 默认读到 `0`；同一会话 `SET SESSION information_schema_stats_expiry = 0` 后读到 `100464`；新会话又是 `0`。`t2s_ro` 只有 `SELECT` 权限也能设这个会话变量，所以构建时先设它。不执行 `ANALYZE TABLE`（只读账号，也不该改业务库统计）。
+  - 5.7 没有这个变量，`TABLE_ROWS` 每次直接取 InnoDB 的估计值。
+  - `TABLE_ROWS` 本身是 InnoDB 的估计（约 10% 行变更后后台重算），不是精确行数；估计偏小时大表会按普通表执行，单条查询由 `MAX_EXECUTION_TIME` 截断成 `TIMEOUT`，这个兜底仍然保留。
 - 带 `NULL` 和空串时，`LIMIT max_distinct + 1` 是在 `WHERE` 过滤之后计数的，和原设计一致；如果以后大表 SQL 去掉 `WHERE`，计数会把 `NULL`、空串也算进去，`TOO_MANY_VALUES` 会稍早触发。
 - SQLBot、WrenAI、Vanna 的值采集没有通读源码。
 - MariaDB 没有测。

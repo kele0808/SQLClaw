@@ -4,7 +4,7 @@
 
 > **修订（2026-11-22）：** spec 02 采纳大 Schema 调研（`docs/research/01-text2sql-sota.md`）后新增 M9 表族与公共列、M10 值索引。本计划随之修改 Task 1（错误码改为 4.12，加 `VALUE_INDEX_NOT_FOUND`）、Task 2（`value_index_*` 配置）、Task 7（3 张值索引表与 `pg_trgm` 进 0002），新增 Task 13–16，原 Task 13–15 顺延为 17–19 并扩展到值索引任务、CLI 和验收 13–16。待确认 1–8 不变。
 
-> **修订（2026-11-22，大表值采集）：** spec 02 4.11 把整表跳过的 `TOO_MANY_ROWS` 改成逐列的「大表索引路径」（`BIG_TABLE_NO_INDEX`、采集期 `EXPLAIN` 门槛 `NO_LOOSE_SCAN`，`DISTINCT` 只放裸列），验收追加 17、18（调研：`docs/research/02-value-index-large-tables.md`）。本计划随之修改 Task 14（`ColumnDecision.path`、`has_loose_scan_index`、新规则顺序）、Task 15（SQL 去掉 `CAST`/`NULL AS tenant_key`、大表先 `EXPLAIN FORMAT=TRADITIONAL`、10 万行大表集成测试、在本机 5.7 / 8.0 上记录 EXPLAIN 结果）、Task 19（验收 1–18）。Task 4/5/7 不变：`IndexInfo` 已有有序 `columns`、`sub_parts`、`index_type`，采集 SQL 已取 `STATISTICS.SUB_PART`，ORM 已有 `sub_parts INT[]`。
+> **修订（2026-11-22，大表值采集）：** spec 02 4.11 把整表跳过的 `TOO_MANY_ROWS` 改成逐列的「大表索引路径」（`BIG_TABLE_NO_INDEX`、采集期 `EXPLAIN` 门槛 `NO_LOOSE_SCAN`，`DISTINCT` 只放裸列），验收追加 17、18（调研：`docs/research/02-value-index-large-tables.md`）。本计划随之修改 Task 14（`ColumnDecision.path`、`has_loose_scan_index`、新规则顺序）、Task 15（SQL 去掉 `CAST`/`NULL AS tenant_key`、大表先 `EXPLAIN FORMAT=TRADITIONAL`、10 万行大表集成测试、在本机 5.7 / 8.0 上记录 EXPLAIN 结果）、Task 19（验收 1–19）。同日再修订：值索引构建前现读 `TABLE_ROWS`（8.0 先 `SET SESSION information_schema_stats_expiry = 0`），`plan_value_columns` 加 `row_estimates`、新跳过原因 `TABLE_GONE`，涉及 Task 14、15、17、19，验收 19。Task 4/5/7 不变：`IndexInfo` 已有有序 `columns`、`sub_parts`、`index_type`，采集 SQL 已取 `STATISTICS.SUB_PART`，ORM 已有 `sub_parts INT[]`。
 
 **Goal:** 按 `docs/specs/02-metadata.md`（状态：已确认）实现元数据目录：把业务 MySQL（5.7 / 8.0）的结构采集成不可变快照存入 PostgreSQL，按内容哈希去重，给表和字段分配跨版本稳定的 `object_uuid`，对注释做注入检测并支持人工复核，提供 release 与发布指针、STALE 标记存储，以及 CLI 和队列任务 `metadata.sync`；并按 2026-11-22 修订（采纳大 Schema 调研）加入表族与公共列（M9）和按租户隔离的值索引（M10，PostgreSQL `pg_trgm` 精确 + 模糊匹配，队列任务 `metadata.value_index`）。第 1 周交付「元数据快照可查询」和值索引。
 
@@ -5125,7 +5125,7 @@ git push origin main
 
 ---
 
-### Task 14: 值索引规则 `value_index.py`：选列、归一化、问题切词（M10、spec 4.11，验收 14、17）
+### Task 14: 值索引规则 `value_index.py`：选列、归一化、问题切词（M10、spec 4.11，验收 14、17、19）
 
 **Files:**
 - Create: `src/text2sql/metadata/value_index.py`
@@ -5134,17 +5134,19 @@ git push origin main
 **Interfaces:**
 - Consumes: Task 4 的 `ColumnData`、`TableData`、`IndexInfo`（`columns` 有序、`sub_parts`、`index_type`）；`tests/metadata_factories.py`。
 - Produces（`text2sql.metadata.value_index`，纯函数）:
-  - `SkipReason = Literal["VIEW", "NO_TENANT_KEY", "TYPE_TOO_LONG", "KEY_COLUMN", "NAME_PATTERN", "SENSITIVE_HINT", "BIG_TABLE_NO_INDEX", "EXCLUDED", "TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"]`（与 spec 4.11 跳过原因一致；最后三个由 Task 15 的采集器给出）。
+  - `SkipReason = Literal["VIEW", "TABLE_GONE", "NO_TENANT_KEY", "TYPE_TOO_LONG", "KEY_COLUMN", "NAME_PATTERN", "SENSITIVE_HINT", "BIG_TABLE_NO_INDEX", "EXCLUDED", "TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"]`（与 spec 4.11 跳过原因一致；最后三个由 Task 15 的采集器给出）。
   - `ScanPath = Literal["normal", "big_table"]`。
   - `ColumnDecision(table, column, tenant_column, skip_reason, path="normal")`，属性 `key`（`"表.列"`）、`eligible`。`path="big_table"` 告诉 Task 15 先做 `EXPLAIN`。
   - `has_loose_scan_index(table, column, tenant_column) -> bool`：存在 `BTREE` 索引，前导列依次是 `(tenant_column, column)`（`tenant_column=None` 时 `column` 是第一列），且这些前导列都是整列（`sub_parts` 对应位置为 `None`）。列名比较不区分大小写。
-  - `plan_value_columns(tables, *, tenant_column: str | None, max_rows: int, include=(), exclude=()) -> list[ColumnDecision]`：每个文本列（`char`/`varchar`/`enum`/`*text`）一条决定。顺序（第一条命中即为原因）：`EXCLUDED` > 表级（`VIEW`、`NO_TENANT_KEY`）> `KEY_COLUMN`（主键、唯一、外键、租户列）> `include` 可解除的软规则（`TYPE_TOO_LONG`、`NAME_PATTERN`、`SENSITIVE_HINT`）> 大表规则 `BIG_TABLE_NO_INDEX`（`row_estimate > max_rows` 且 `has_loose_scan_index` 为假；include 不能解除）。
+  - `plan_value_columns(tables, *, tenant_column: str | None, max_rows: int, include=(), exclude=(), row_estimates: Mapping[str, int | None] | None = None) -> list[ColumnDecision]`：每个文本列（`char`/`varchar`/`enum`/`*text`）一条决定。`row_estimates` 是 Task 15 `live_row_estimates` 现读的 `TABLE_ROWS`：非 `None` 的值代替快照 `row_estimate`，`None` 回退快照值，快照里的基表不在其中 → `TABLE_GONE`；参数为 `None` 时只用快照值。顺序（第一条命中即为原因）：`EXCLUDED` > 表级（`VIEW`、`TABLE_GONE`、`NO_TENANT_KEY`）> `KEY_COLUMN`（主键、唯一、外键、租户列）> `include` 可解除的软规则（`TYPE_TOO_LONG`、`NAME_PATTERN`、`SENSITIVE_HINT`）> 大表规则 `BIG_TABLE_NO_INDEX`（行数估计 `> max_rows` 且 `has_loose_scan_index` 为假；include 不能解除）。
   - `normalize_value(value) -> str`：NFKC + casefold + 折叠空白。
   - `QueryTerms(grams, spans)`；`query_terms(text, *, min_len=2, max_len=16, max_grams=2000)`：每个词串的全部 2–16 字子串（长的在前）作精确匹配候选，整段词串作模糊匹配候选。
 
 选列规则参考 CHESS 的预处理（跳过 id、url、email、电话、地址类列，只留短文本列）和 supersonic 的维度值词典（只收低基数维度列）；另加两条自己的规则：注释像敏感信息的列跳过（`SENSITIVE_HINT`，中文提示词），多租户库里没有租户列的表整表跳过（`NO_TENANT_KEY`）——值索引是业务数据在 PG 里的副本，不受业务库的租户隔离保护，宁可漏收也不能串租户（spec 4.11、架构 11.1）。
 
 大表规则（2026-11-22 修订）参考 MySQL 的松散索引扫描：`SELECT DISTINCT a, b` 只有在 `(a, b)` 是某个 BTREE 索引的最左前缀、且不是前缀索引时，才能按「每个不同值读一次索引」执行，成本和行数无关（MySQL 手册 GROUP BY Optimization）。所以超过 `max_rows` 的表不再整表跳过，而是逐列看索引：`(tenant_id, status)` 有索引的 `status` 照样采，没有的记 `BIG_TABLE_NO_INDEX`。它排在软规则之后，因为它是唯一能靠「加索引」解决的原因：大表上的 `remark TEXT` 应该报 `TYPE_TOO_LONG`，而不是让人去建索引。规则只看快照里的 `IndexInfo`，函数仍然是纯的；优化器是否真的选松散扫描由 Task 15 的 `EXPLAIN` 门槛确认。
+
+行数为什么要现读（spec 4.11「构建时现读行数」）：结构不变时快照沿用旧快照，`row_estimate` 会停在当时的值；表从 100 万涨到 300 万，快照还说 100 万。所以 Task 17 在规划前调用 Task 15 的 `live_row_estimates`，把结果作为 `row_estimates` 传进来。读库放在调用方，`plan_value_columns` 只接收一个字典，仍然是纯函数，测试里直接传字典就行。快照里有、现读结果里没有的表说明快照之后被删了，记 `TABLE_GONE`：现有原因都不贴切（它不是视图、也不是缺租户列），下一次 `sync` 产生新快照后自然消失；名字 10 个字符，`skip_reason VARCHAR(32)` 放得下。
 
 `query_terms` 不用中文分词器：问题里逐字出现的值（「华东区」「微信」）一定是某个子串，精确匹配用 `value_norm IN (…)` 一次查完；变体（「华东精密」对「华东精密有限公司」）交给 Task 16 的 `pg_trgm` 模糊匹配。`max_grams` 防止超长问题生成过多候选。
 
@@ -5288,6 +5290,30 @@ def test_big_table_rule_without_tenant_and_with_include() -> None:
     assert lifted["t_customer.profile"] == "BIG_TABLE_NO_INDEX"  # FULLTEXT is not BTREE
 
 
+def test_live_row_estimates_override_the_snapshot() -> None:
+    tag = make_table("t_tag", (make_column("tenant_id", 1), _text("tag", 2)), row_estimate=10)
+    view = make_table("v_customer", (_text("region", 1),), table_type="VIEW")
+    tables = (_customer(row_estimate=1000), tag, view)
+
+    live = {
+        d.key: d
+        for d in plan_value_columns(
+            tables,
+            tenant_column="tenant_id",
+            max_rows=10**6,
+            row_estimates={"t_customer": 5_000_000},  # t_tag dropped since the snapshot
+        )
+    }
+    assert live["t_customer.region"].path == "big_table"
+    assert live["t_customer.region"].skip_reason == "BIG_TABLE_NO_INDEX"
+    assert live["t_tag.tag"].skip_reason == "TABLE_GONE"
+    assert live["v_customer.region"].skip_reason == "VIEW"  # views are not in TABLE_ROWS
+
+    fallback = _reasons(tables, row_estimates={"t_customer": None, "t_tag": 10})
+    assert fallback["t_customer.region"] is None  # NULL TABLE_ROWS -> snapshot's 1000
+    assert fallback["t_tag.tag"] is None
+
+
 def test_include_lifts_soft_rules_and_exclude_always_wins() -> None:
     reasons = _reasons(
         (_customer(),),
@@ -5343,7 +5369,7 @@ distinct values, not rows. The collector confirms that plan with EXPLAIN.
 
 import re
 import unicodedata
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -5351,6 +5377,7 @@ from text2sql.metadata.snapshot import ColumnData, TableData
 
 SkipReason = Literal[
     "VIEW",
+    "TABLE_GONE",
     "NO_TENANT_KEY",
     "TYPE_TOO_LONG",
     "KEY_COLUMN",
@@ -5447,8 +5474,13 @@ def plan_value_columns(
     max_rows: int,
     include: Collection[str] = (),
     exclude: Collection[str] = (),
+    row_estimates: Mapping[str, int | None] | None = None,
 ) -> list[ColumnDecision]:
     """One decision per text column (char/varchar/enum/text types), in snapshot order.
+
+    `row_estimates` holds TABLE_ROWS read at build time (`live_row_estimates`):
+    a value overrides the snapshot's `row_estimate`, None falls back to it, and a
+    base table missing from it was dropped after the snapshot (`TABLE_GONE`).
 
     `include` / `exclude` hold `table.column` keys (Spec 05 `columns.yaml`
     `value_index` later feeds them). `exclude` always wins; `include` only lifts
@@ -5464,11 +5496,21 @@ def plan_value_columns(
         if tenant is not None:
             key_columns.add(tenant)
         table_tenant = names.get(tenant) if tenant is not None else None
-        big = table.row_estimate is not None and table.row_estimate > max_rows
+        estimate = table.row_estimate
+        gone = False
+        if row_estimates is not None and table.table_type != "VIEW":
+            if table.name not in row_estimates:
+                gone = True
+            else:
+                live = row_estimates[table.name]
+                estimate = estimate if live is None else live
+        big = estimate is not None and estimate > max_rows
         path: ScanPath = "big_table" if big else "normal"
         table_reason: SkipReason | None = None
         if table.table_type == "VIEW":
             table_reason = "VIEW"
+        elif gone:
+            table_reason = "TABLE_GONE"
         elif tenant is not None and table_tenant is None:
             table_reason = "NO_TENANT_KEY"
         for column in table.columns:
@@ -5529,7 +5571,7 @@ def query_terms(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/metadata/test_value_index.py -v`
-Expected: `9 passed`。
+Expected: `10 passed`。
 
 - [ ] **Step 5: Quality gates**
 
@@ -5546,7 +5588,7 @@ git push origin main
 
 ---
 
-### Task 15: 值采集器 `collector/values.py`（M10、spec 4.11，验收 15 的采集部分、验收 18）
+### Task 15: 值采集器 `collector/values.py`（M10、spec 4.11，验收 15 的采集部分、验收 18、19）
 
 **Files:**
 - Create: `src/text2sql/metadata/collector/values.py`
@@ -5558,6 +5600,7 @@ git push origin main
 - Produces（`text2sql.metadata.collector.values`）:
   - `CollectedColumn(table, column, values: tuple[tuple[str | None, str], ...], skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"] | None)`，`values` 为 `(tenant_key, value)`，按查询返回的顺序。
   - `quote_identifier(name) -> str`（反引号转义）；`distinct_values_sql(table, column, *, tenant_column, timeout_ms) -> str`：`SELECT /*+ MAX_EXECUTION_TIME(ms) */ DISTINCT [`tenant` AS tenant_key,] `col` AS value FROM t WHERE col IS NOT NULL AND col <> '' AND CHAR_LENGTH(col) <= :max_length LIMIT :limit`。`DISTINCT` 里只放裸列：不写 `CAST(... AS CHAR)`，关闭租户规则时也不写 `NULL AS tenant_key`，租户键在 Python 里转字符串。
+  - `ROW_ESTIMATES_SQL`、`STATS_EXPIRY_SQL`；`live_row_estimates(engine, database, *, server_version) -> dict[str, int | None]`：同一条连接上，8.0（`server_version >= (8, 0, 0)`）先执行 `SET SESSION information_schema_stats_expiry = 0`，再执行 `SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'`（`:db` 绑定）。结果交给 Task 14 的 `row_estimates`。
   - `explain_sql(sql) -> str`（`EXPLAIN FORMAT=TRADITIONAL ` + sql）；`LOOSE_SCAN_MARKER = "Using index for group-by"`；`uses_loose_scan(plan_rows) -> bool`：任一行的 `Extra` 含标记。
   - `collect_values(engine, decisions, *, max_distinct, max_length, timeout_ms) -> list[CollectedColumn]`：只处理 `eligible` 的列，每列一条查询，`LIMIT max_distinct + 1`，超过即 `TOO_MANY_VALUES`；`path == "big_table"` 的列先执行 `explain_sql(...)`，没有松散索引扫描就记 `NO_LOOSE_SCAN` 且不执行取值查询；MySQL 错误码 3024（8.0 `MAX_EXECUTION_TIME` 超时）或 1969（MariaDB）记为 `TIMEOUT`，其他错误照常抛出；超长值在 SQL 的 `WHERE` 里就被过滤。
   - `TIMEOUT_ERROR_CODES = frozenset({3024, 1969})`、`mysql_error_code(exc) -> int | None`。
@@ -5577,6 +5620,8 @@ git push origin main
 | `DISTINCT tenant_id, channel`（`channel` 无索引） | `Using where; Using temporary`（`type = ALL`） | 同左 |
 | 4 行小表上的 `DISTINCT tenant_id, status` | `Using where; Using index; Using temporary` | 同左 |
 
+现读行数（spec 4.11「构建时现读行数」）：写计划时在 8.0.46 上实测，root 往空表插 10 万行、不 `ANALYZE` 时，`t2s_ro` 默认读到的 `TABLE_ROWS` 是缓存的 `0`（`information_schema_stats_expiry = 86400`），同一会话 `SET SESSION information_schema_stats_expiry = 0` 后读到 `100464`；`t2s_ro` 只有 `SELECT` 也能设这个会话变量，`t2s_business` 的 `TABLES` 行它也读得到。5.7 没有这个变量，`TABLE_ROWS` 每次直接取存储引擎的估计值。
+
 所以：`DISTINCT` 里不能有 `CAST` 或常量；`WHERE` 过滤不影响松散扫描；小表优化器不选松散扫描，`EXPLAIN` 门槛只对大表用。集成测试因此自己建一张 10 万行的 `t_order_big`（用 10 行的 `t_digit` 交叉连接生成，root 执行，约 1 秒），并 `ANALYZE TABLE` 让 `TABLE_ROWS` 准确（8.0 的 `information_schema_stats_expiry` 缓存也会被 `ANALYZE TABLE` 刷新）。Step 7 在你本机再跑一次这张表，确认结论没变。
 
 - [ ] **Step 1: Write the failing unit tests**
@@ -5593,9 +5638,12 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
 
 from text2sql.metadata.collector.values import (
+    ROW_ESTIMATES_SQL,
+    STATS_EXPIRY_SQL,
     collect_values,
     distinct_values_sql,
     explain_sql,
+    live_row_estimates,
     mysql_error_code,
     quote_identifier,
     uses_loose_scan,
@@ -5669,11 +5717,11 @@ class _Conn:
 
 
 class _Engine:
-    def __init__(self, conn: _Conn) -> None:
+    def __init__(self, conn: Any) -> None:
         self.conn = conn
 
     @contextmanager
-    def connect(self) -> Iterator[_Conn]:
+    def connect(self) -> Iterator[Any]:
         yield self.conn
 
 
@@ -5753,6 +5801,31 @@ def test_other_operational_errors_propagate() -> None:
 def test_mysql_error_code() -> None:
     assert mysql_error_code(_timeout(1969)) == 1969
     assert mysql_error_code(OperationalError("x", {}, Exception("no code"))) is None
+
+
+class _RecordingConn:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+        self.calls: list[tuple[str, Mapping[str, Any] | None]] = []
+
+    def execute(self, statement: Any, params: Mapping[str, Any] | None = None) -> _Result:
+        self.calls.append((str(statement), params))
+        return _Result(self.rows if params else [])
+
+
+@pytest.mark.parametrize(("version", "sets_expiry"), [((8, 0, 46), True), ((5, 7, 44), False)])
+def test_live_row_estimates(version: tuple[int, int, int], sets_expiry: bool) -> None:
+    conn = _RecordingConn([("t_order", 2_500_000), ("t_new", None)])
+    estimates = live_row_estimates(
+        cast(Engine, _Engine(conn)), "t2s_business", server_version=version
+    )
+    assert estimates == {"t_order": 2_500_000, "t_new": None}
+    expected: list[tuple[str, Mapping[str, Any] | None]] = [
+        (ROW_ESTIMATES_SQL, {"db": "t2s_business"})
+    ]
+    if sets_expiry:
+        expected.insert(0, (STATS_EXPIRY_SQL, None))
+    assert conn.calls == expected
 ```
 
 - [ ] **Step 2: Write the failing integration test**
@@ -5765,7 +5838,7 @@ import pytest
 from tests.integration.metadata.conftest import MysqlFixture
 from text2sql.db.business import get_business_engine
 from text2sql.metadata.collector.mysql import collect_snapshot
-from text2sql.metadata.collector.values import collect_values
+from text2sql.metadata.collector.values import collect_values, live_row_estimates
 from text2sql.metadata.value_index import plan_value_columns
 
 pytestmark = pytest.mark.integration
@@ -5841,8 +5914,14 @@ def test_big_table_is_read_through_its_index(mysql_fixture: MysqlFixture) -> Non
         mysql_fixture.execute(sql)
     engine = get_business_engine()
     data = collect_snapshot(engine, mysql_fixture.datasource_id)
+    live = live_row_estimates(engine, data.database_name, server_version=data.server.version)
+    assert set(live) == {"t_customer", "t_digit", "t_order_big", "t_work_order", "t_work_process"}
+    assert (live["t_order_big"] or 0) > 1000
     decisions = {
-        d.key: d for d in plan_value_columns(data.tables, tenant_column="tenant_id", max_rows=1000)
+        d.key: d
+        for d in plan_value_columns(
+            data.tables, tenant_column="tenant_id", max_rows=1000, row_estimates=live
+        )
     }
     status = decisions["t_order_big.status"]
     assert (status.skip_reason, status.path) == (None, "big_table")
@@ -5897,6 +5976,13 @@ from text2sql.metadata.value_index import ColumnDecision
 # MySQL ER_QUERY_TIMEOUT (MAX_EXECUTION_TIME exceeded); MariaDB ER_STATEMENT_TIMEOUT.
 TIMEOUT_ERROR_CODES = frozenset({3024, 1969})
 LOOSE_SCAN_MARKER = "Using index for group-by"
+ROW_ESTIMATES_SQL = (
+    "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES "
+    "WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'"
+)
+# 8.0 caches TABLE_ROWS for information_schema_stats_expiry (default 86400 s);
+# 0 makes this session read the storage engine. Session-only, needs no privilege.
+STATS_EXPIRY_SQL = "SET SESSION information_schema_stats_expiry = 0"
 
 CollectSkipReason = Literal["TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"]
 
@@ -5933,6 +6019,17 @@ def distinct_values_sql(
         f"WHERE {col} IS NOT NULL AND {col} <> '' AND CHAR_LENGTH({col}) <= :max_length "
         "LIMIT :limit"
     )
+
+
+def live_row_estimates(
+    engine: Engine, database: str, *, server_version: tuple[int, int, int]
+) -> dict[str, int | None]:
+    """TABLE_ROWS of every base table now; the snapshot's values may be old."""
+    with engine.connect() as conn:
+        if server_version >= (8, 0, 0):
+            conn.execute(text(STATS_EXPIRY_SQL))
+        rows = conn.execute(text(ROW_ESTIMATES_SQL), {"db": database}).all()
+    return {_text(name): None if count is None else int(count) for name, count in rows}
 
 
 def explain_sql(sql: str) -> str:
@@ -6008,7 +6105,7 @@ def collect_values(
 - [ ] **Step 5: Run unit tests**
 
 Run: `uv run pytest tests/unit/metadata/test_collector_values.py -v`
-Expected: `7 passed`。
+Expected: `9 passed`。
 
 - [ ] **Step 6: Run integration test**
 
@@ -6467,13 +6564,13 @@ git push origin main
 - Test: `tests/unit/metadata/test_sync_job.py`, `tests/integration/metadata/test_sync.py`
 
 **Interfaces:**
-- Consumes: Task 5 `collect_snapshot`；Task 9 `save_snapshot`、`latest_snapshot_id`、`load_snapshot`；Task 14 `plan_value_columns`；Task 15 `collect_values`；Task 16 `save_value_build`、`search_values`；Spec 01 `register`、`NonRetryableJobError`、`get_business_engine`、`session_scope`、`enqueue`、`run_once`。
+- Consumes: Task 5 `collect_snapshot`；Task 9 `save_snapshot`、`latest_snapshot_id`、`load_snapshot`；Task 14 `plan_value_columns`；Task 15 `collect_values`、`live_row_estimates`；Task 16 `save_value_build`、`search_values`；Spec 01 `register`、`NonRetryableJobError`、`get_business_engine`、`session_scope`、`enqueue`、`run_once`。
 - Produces:
   - `text2sql.metadata.jobs.SYNC_KIND = "metadata.sync"`、`SyncResult(snapshot_id, unchanged, table_count, column_count, flagged_comment_count)`
   - `run_sync(requested_by: str) -> SyncResult`：采集 → 保存 → 日志 `metadata_sync_started` / `metadata_sync_finished`（字段 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`；`trace_id` 由 Spec 01 的 JSON formatter 自动带上）
   - `handle_sync(payload)`，`@register("metadata.sync")`；`payload["datasource_id"] != Settings.datasource_id` 时抛 `NonRetryableJobError`
   - `VALUE_INDEX_KIND = "metadata.value_index"`、`ValueIndexResult(build_id, snapshot_id, indexed_column_count, skipped_column_count, value_count)`
-  - `run_value_index(requested_by, *, include=(), exclude=()) -> ValueIndexResult`：取最新快照（没有则 `AppError(METADATA_SNAPSHOT_NOT_FOUND, …, 404)`）→ `plan_value_columns`（`tenant_column = Settings.value_index_tenant_column or None`）→ `collect_values` → `save_value_build`；日志 `metadata_value_index_finished`。采集在事务外进行，只有保存占用 PG 事务。
+  - `run_value_index(requested_by, *, include=(), exclude=()) -> ValueIndexResult`：取最新快照（没有则 `AppError(METADATA_SNAPSHOT_NOT_FOUND, …, 404)`）→ `live_row_estimates`（快照的 `database_name`、`server.version`，现读 `TABLE_ROWS`）→ `plan_value_columns`（`tenant_column = Settings.value_index_tenant_column or None`，`row_estimates` = 现读结果）→ `collect_values` → `save_value_build`；日志 `metadata_value_index_finished`。采集在事务外进行，只有保存占用 PG 事务。
   - `handle_value_index(payload)`，`@register("metadata.value_index")`；payload `{"datasource_id", "requested_by", "include"?: [...], "exclude"?: [...]}`，数据源检查同 `handle_sync`
   - `text2sql.jobs.worker.HANDLER_MODULES`、`load_handler_modules()`
 
@@ -6776,7 +6873,7 @@ from text2sql.jobs.worker import register
 from text2sql.metadata.catalog.repository import latest_snapshot_id, load_snapshot, save_snapshot
 from text2sql.metadata.catalog.value_store import save_value_build
 from text2sql.metadata.collector.mysql import collect_snapshot
-from text2sql.metadata.collector.values import collect_values
+from text2sql.metadata.collector.values import collect_values, live_row_estimates
 from text2sql.metadata.value_index import plan_value_columns
 
 logger = logging.getLogger(__name__)
@@ -6840,6 +6937,8 @@ def run_value_index(
 ) -> ValueIndexResult:
     """Plan columns from the latest snapshot, read their values, save one build.
 
+    Row estimates are read live first: an unchanged schema keeps an old
+    snapshot, so its `row_estimate` can be far out of date (Spec 02 4.11).
     The business reads happen outside any system-DB transaction; the build is
     written in one short transaction at the end.
     """
@@ -6850,16 +6949,21 @@ def run_value_index(
         snapshot_id = latest_snapshot_id(session, datasource_id)
         if snapshot_id is None:
             raise AppError(METADATA_SNAPSHOT_NOT_FOUND, f"no snapshot for {datasource_id}", 404)
-        tables = load_snapshot(session, snapshot_id).tables
+        snapshot = load_snapshot(session, snapshot_id)
+    engine = get_business_engine()
+    row_estimates = live_row_estimates(
+        engine, snapshot.database_name, server_version=snapshot.server.version
+    )
     decisions = plan_value_columns(
-        tables,
+        snapshot.tables,
         tenant_column=settings.value_index_tenant_column or None,
         max_rows=settings.value_index_max_rows,
         include=include,
         exclude=exclude,
+        row_estimates=row_estimates,
     )
     collected = collect_values(
-        get_business_engine(),
+        engine,
         decisions,
         max_distinct=settings.value_index_max_distinct,
         max_length=settings.value_index_max_value_length,
@@ -7574,7 +7678,7 @@ git push origin main
 
 ---
 
-### Task 19: 文档与整体验收（验收 1–18）
+### Task 19: 文档与整体验收（验收 1–19）
 
 **Files:**
 - Modify: `README.md`（在「本地开发」末尾追加小节）、`AGENTS.md`（状态行 + 命令）
@@ -7650,6 +7754,7 @@ Append to `README.md`:
 16. `test_value_store.py`（精确 + 模糊、按租户隔离、只留 2 次构建）、`tests/integration/test_migrations.py`（`pg_trgm` 已安装、3 张值索引表随 0002 建出和回滚）。
 17. `tests/unit/metadata/test_value_index.py::test_big_tables_need_a_full_leading_index`、`::test_big_table_rule_without_tenant_and_with_include`。
 18. `tests/unit/metadata/test_collector_values.py::test_big_table_columns_are_read_only_through_a_loose_index_scan`、`tests/integration/metadata/test_collector_values.py::test_big_table_is_read_through_its_index`（5.7、8.0 各一次）；Task 15 Step 7 的 EXPLAIN 记录已写进 research 02。
+19. `tests/unit/metadata/test_value_index.py::test_live_row_estimates_override_the_snapshot`、`tests/unit/metadata/test_collector_values.py::test_live_row_estimates`（8.0 / 5.7 两个参数）、`tests/integration/metadata/test_collector_values.py::test_big_table_is_read_through_its_index`（现读值 > 1000）、`tests/integration/metadata/test_sync.py::test_value_index_job_builds_from_latest_snapshot`（`run_value_index` 走现读路径）。
 
 - [ ] **Step 4: Commit and push**
 
@@ -7676,9 +7781,9 @@ git push origin main
 | M7 STALE 存储（部分唯一、重复标记追加、`StaleSet`、不缓存） | 7、12 |
 | M8 CLI 全部子命令；队列 `metadata.sync`；不可重试错误；开始/结束日志 | 17、18 |
 | M9 表族与公共列（同词干 + 同列签名、代表表、公共列阈值、不进哈希；CLI `structure`） | 13、18 |
-| M10 值索引（选列规则与跳过原因、大表索引路径与 EXPLAIN 门槛、有界采集、超时、3 张表与 `pg_trgm`、保留 2 次构建、按租户精确 + 模糊检索、队列 `metadata.value_index`、CLI `values`、`VALUE_INDEX_NOT_FOUND`） | 2、7、14、15、16、17、18 |
+| M10 值索引（选列规则与跳过原因、大表索引路径与 EXPLAIN 门槛、构建时现读 `TABLE_ROWS`、有界采集、超时、3 张表与 `pg_trgm`、保留 2 次构建、按租户精确 + 模糊检索、队列 `metadata.value_index`、CLI `values`、`VALUE_INDEX_NOT_FOUND`） | 2、7、14、15、16、17、18 |
 | 4.1 `T2S_DATASOURCE_ID`、`value_index_*`、`.env.example` 用 `local_mysql80`、`METADATA_NO_DATABASE` | 2、5 |
-| §5 验收 1–18 | 19（逐条映射到测试） |
+| §5 验收 1–19 | 19（逐条映射到测试） |
 | §6 无新增依赖 | Global Constraints |
 
 ### 2. Placeholder scan

@@ -58,13 +58,14 @@ LLM 写出：WHERE c.name = '华东精密'
 | 环节 | 做法 | 位置 |
 | --- | --- | --- |
 | 选列 | 只看非键、非敏感、低基数的文本列；按租户存；一组有先后顺序的跳过原因 | spec 02 §4.11 列筛选；plan 02 Task 14 |
+| 行数估计 | 构建时现读 `information_schema.TABLES.TABLE_ROWS`（8.0 先 `SET SESSION information_schema_stats_expiry = 0`），不用快照里可能过时的值；快照之后被删的表记 `TABLE_GONE` | spec 02 §4.11 构建时现读行数；plan 02 Task 15、17 |
 | 大表 | 逐列判断：有 `(租户列, 本列)` 前导整列 BTREE 索引才采，否则 `BIG_TABLE_NO_INDEX` | spec 02 §4.11；plan 02 Task 14 |
 | 大表执行前 | `EXPLAIN FORMAT=TRADITIONAL`，看到 `Using index for group-by` 才执行，否则 `NO_LOOSE_SCAN` | spec 02 §4.11 采集；plan 02 Task 15 |
 | SQL | `DISTINCT` 只放裸列，租户键在 Python 里转字符串；`MAX_EXECUTION_TIME` + `LIMIT max_distinct + 1` | spec 02 §4.11；plan 02 Task 15 |
 | 存储与检索 | PG 三张表，`pg_trgm` 精确 + 模糊匹配，强制按租户过滤，保留最近 2 次构建 | spec 02 §4.11 存储 / 检索；plan 02 Task 16 |
 | 没有索引的大表枚举列 | 由人在 `columns.yaml` 写 `values: [...]`，不扫业务库 | spec 05 §4.1 |
 | 兜底 | 值索引只给候选；最终值由网关到业务库 `IN (...)` 精确确认 | spec 08 A5 |
-| 验收 | spec 02 验收 14–18；spec 05 验收 12 | — |
+| 验收 | spec 02 验收 14–19；spec 05 验收 12 | — |
 
 ## 6. 为什么这样解决 / 不采纳什么
 
@@ -77,6 +78,6 @@ LLM 写出：WHERE c.name = '华东精密'
 ## 7. 未验证项
 
 - `WHERE` 里的 `IS NOT NULL` / `<> ''` / `CHAR_LENGTH` 不影响松散扫描：只在本机 10 万行临时表上验证，plan 02 Task 15 Step 7 会在夹具上再测一次。
-- `row_estimate` 可能过时（结构不变沿用旧快照、8.0 统计缓存），表在两次快照之间变大时靠 `MAX_EXECUTION_TIME` 截断。
+- 行数估计在构建时现读，8.0 会话里关掉统计缓存（本机 8.0.46 实测有效：同一张表默认读到 `0`，关掉后 `100464`）；但 `TABLE_ROWS` 仍是 InnoDB 估计，偏小时靠 `MAX_EXECUTION_TIME` 截断成 `TIMEOUT`。不执行 `ANALYZE TABLE`。
 - 中文同义词、拼音、简称（"华东精密" ↔ "HDJM"）不在 MVP，阶段 2 再做。
 - 真实库的租户列名是否统一、值能否进 LLM 上下文：spec 02 开放决策 3。
