@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,17 @@ class Settings(BaseSettings):
     business_db_timeout_s: int = 5
     job_poll_interval_s: float = 1.0
     job_lease_s: int = 300
+    # One process serves one business data source (Spec 02 4.1).
+    datasource_id: str = Field(default="local", pattern=r"^[a-z0-9_]{1,64}$")
+    # Value index (Spec 02 M10): distinct values of low-cardinality text columns.
+    value_index_max_distinct: int = Field(default=5000, ge=1)
+    value_index_max_rows: int = Field(default=2_000_000, ge=1)
+    value_index_max_value_length: int = Field(default=128, ge=1, le=512)
+    # Must stay below business_db_timeout_s, the client read timeout.
+    value_index_timeout_ms: int = Field(default=3000, ge=100)
+    # Tables without this column are skipped so values never cross tenants.
+    # Empty string disables the check (single-tenant databases).
+    value_index_tenant_column: str = "tenant_id"
 
 
 @lru_cache(maxsize=1)

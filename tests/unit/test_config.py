@@ -59,3 +59,29 @@ def test_secrets_are_masked(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
+
+
+def test_datasource_id_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert get_settings().datasource_id == "local"
+    get_settings.cache_clear()
+    monkeypatch.setenv("T2S_DATASOURCE_ID", "local_mysql57")
+    assert get_settings().datasource_id == "local_mysql57"
+
+
+@pytest.mark.parametrize("bad", ["Local", "has-dash", "", "x" * 65, "a b"])
+def test_datasource_id_pattern_is_enforced(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    monkeypatch.setenv("T2S_DATASOURCE_ID", bad)
+    with pytest.raises(ValidationError):
+        get_settings()
+
+
+def test_value_index_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    assert settings.value_index_max_distinct == 5000
+    assert settings.value_index_max_rows == 2_000_000
+    assert settings.value_index_max_value_length == 128
+    assert settings.value_index_timeout_ms == 3000
+    assert settings.value_index_tenant_column == "tenant_id"
+    get_settings.cache_clear()
+    monkeypatch.setenv("T2S_VALUE_INDEX_TENANT_COLUMN", "")
+    assert get_settings().value_index_tenant_column == ""
