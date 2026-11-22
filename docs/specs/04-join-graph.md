@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 5）。`Evidence` 预留 `NAME_MATCH`、`VALUE_INCLUSION`、`QUERY_LOG` 三种推断证据，只能出现在 `CANDIDATE` 边或作为人工确认边的附加证据；4.4 新增校验码 `INFERRED_EVIDENCE_ONLY`；§7 补充表数上百后的路径算法参考。**MVP** 只加枚举值和校验；三种候选生成器属于**阶段 2**。
 - 对应架构文档：第六章（6.2～6.6 及修订）、10.3（Edge / Fan-out Validation）、1.4（Join 关系确认人）、第二十三章（第 2 周）
 - 依赖：Spec 01、Spec 02（`SchemaSnapshot`、`metadata_release`、`StaleSet`、对象键）、Spec 03（合成库与 `required_tables`，用于验收）
 - 被依赖：05（维度关联路径引用边 ID）、06（Join Planner、预聚合）、07（JOIN 条件与扇出校验）、08（兜底通道的允许边、Join Expansion）、09（影响分析）
@@ -102,7 +104,13 @@ edges:
 ```
 
 ```python
-Evidence = Literal["FOREIGN_KEY", "PRIMARY_KEY", "UNIQUE_KEY", "HUMAN_CONFIRMED"]
+Evidence = Literal[
+    "FOREIGN_KEY", "PRIMARY_KEY", "UNIQUE_KEY", "HUMAN_CONFIRMED",
+    # 2026-11-22 预留：推断证据，阶段 2 的候选生成器产出，单独不能使边成为 VERIFIED（4.4 INFERRED_EVIDENCE_ONLY）
+    "NAME_MATCH",        # 列名约定匹配，如 t_work_order.customer_id ↔ t_customer.id
+    "VALUE_INCLUSION",   # 采样值包含关系：源列非空值 ⊆ 目标列值（架构 17.1 数据画像）
+    "QUERY_LOG",         # 历史查询日志中出现过该 JOIN 条件
+]
 EdgeStatus = Literal["CANDIDATE", "VERIFIED", "DEPRECATED"]
 
 class EdgeEnd(BaseModel, frozen=True):
@@ -156,6 +164,8 @@ def fk_candidates(snapshot: SchemaSnapshot, existing: Sequence[JoinEdge]) -> lis
 - 外键引用列集合等于目标表某个唯一列集合（`snapshot.unique_column_sets`）时生成 `MANY_TO_ONE`，证据 `FOREIGN_KEY` + `PRIMARY_KEY`/`UNIQUE_KEY`；外键列本身在源表也唯一时生成 `ONE_TO_ONE`。
 - 引用列不唯一的外键（MySQL 允许引用非唯一索引）生成 `status: CANDIDATE`、证据仅 `FOREIGN_KEY`、并加注释"目标列不唯一，需人工确认基数"。
 - 生成的边 `status` 一律为 `CANDIDATE`，`join_role` 取 `<FROM表去前缀>_<TO表去前缀>` 的大写形式，`confirmed_by` 为空。
+- **阶段 2 的候选来源**（2026-11-22 预留，MVP 不实现）：列名约定（`NAME_MATCH`）、Spec 02 之外的采样值包含检查（`VALUE_INCLUSION`，依赖架构 17.1 数据画像）、历史查询日志挖掘（`QUERY_LOG`）。三者生成的边一律 `CANDIDATE`，进入同一个 `joins.candidates.yaml` 由确认人审核。
+  > 参考：[LinkedIn SQL Bot](https://arxiv.org/abs/2507.14372) 从查询日志和 DataHub 中挖掘表关系与常用 JOIN；[Uber QueryGPT](https://www.uber.com/blog/query-gpt/) 用历史 SQL 样例提供 JOIN 写法；[CHESS](https://arxiv.org/abs/2405.16755) 的值索引也用于发现值层面的关联。共同点是推断结果只作候选，最终由人或约束确认——与架构 6.2 修订"采样只产出候选"一致。
 - CLI 把候选写到 `semantic_definitions/<model>/joins.candidates.yaml`（不覆盖 `joins.yaml`）。确认人把候选挪进 `joins.yaml`、补全 `join_role`/`confirmed_by`/`confirmed_at`、改为 `VERIFIED`，然后提 PR。外键以外的关系（本合成库中的大多数）由确认人直接手写。
 
 ### 4.4 J4 加载与校验
@@ -183,6 +193,7 @@ def build_join_graph(defs: JoinDefinitions, snapshot: SchemaSnapshot) -> JoinGra
 | `UNIQUENESS_NOT_PROVEN` | `to` 列集合是快照中的唯一列集合，或证据含 `HUMAN_CONFIRMED`；`ONE_TO_ONE` 两端都要满足（架构 6.2 修订：PK/UK 或人工确认是必要条件） |
 | `EVIDENCE_MISMATCH` | 证据声明 `PRIMARY_KEY`/`UNIQUE_KEY`/`FOREIGN_KEY` 时，快照中确有对应约束 |
 | `CONFIRMATION_MISSING` | `VERIFIED` 边必须有 `confirmed_by`、`confirmed_at` |
+| `INFERRED_EVIDENCE_ONLY`（2026-11-22） | `VERIFIED` 边的证据必须含 `FOREIGN_KEY`、`PRIMARY_KEY`、`UNIQUE_KEY`、`HUMAN_CONFIRMED` 之一；只有 `NAME_MATCH`/`VALUE_INCLUSION`/`QUERY_LOG` 的边只能是 `CANDIDATE` |
 | `DUPLICATE_ID` / `DUPLICATE_EDGE` | 边 ID 唯一；同一列对不能定义两次 |
 | `BRIDGE_INVALID` | `bridge_tables` 中的表恰有 2 条以它为 `from` 的 VERIFIED 边，且这两条边的 from 列的并集包含该表主键 |
 
@@ -308,6 +319,7 @@ def load_join_graph(session: Session, version_id: int, snapshot: SchemaSnapshot)
 8. `check-acceptance` 对当时已标注的全部验收题无不可连通项（第 2 周交付标准）。
 9. `save_join_graph_version` 对相同内容幂等；对 `join_graph_version` 的 UPDATE 被拒绝。
 10. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
+11. （2026-11-22）证据只有 `NAME_MATCH` 的 `VERIFIED` 边报 `INFERRED_EVIDENCE_ONLY`；同一条边改为 `CANDIDATE` 时只产生警告；`NAME_MATCH` + `HUMAN_CONFIRMED` 的 `VERIFIED` 边通过（单元测试）。
 
 ## 6. 新增依赖
 
@@ -319,6 +331,7 @@ def load_join_graph(session: Session, version_id: int, snapshot: SchemaSnapshot)
 - **多数边依赖人工确认**：合成库刻意让大部分关联没有外键，模拟真实 MySQL 业务库（架构 4.1 注意事项）。`UNIQUENESS_HUMAN_ONLY` 的边一旦确认错，会导致计数放大且 SQL 能正常执行；确认人需要对照数据核实（MVP 不做自动采样校验，阶段 2 补"值校验"证据）。
 - **规范方向的取舍**：只保留 `MANY_TO_ONE`/`ONE_TO_ONE` 两种类型，YAML 作者需要把"一对多"反过来写。好处是扇出只由遍历方向决定，Spec 06/07 的判定不需要再查类型表。
 - **路径枚举的规模假设**：枚举算法按 1.3 待填的表规模（约 100 张以内，架构 8.5 阶段 A）设计；表数到数百张时需要换成带剪枝的 Steiner 树近似，届时另写 Spec。
+  > 参考（2026-11-22）：[QueryWeaver](https://github.com/FalkorDB/QueryWeaver) 把表和外键存成图，对检索命中的表求最短路径补齐中间表；[Spider 2.0](https://arxiv.org/abs/2411.07763) 的企业库常超过 1000 列。我们**不引入图数据库**（架构第二十四章"不采纳"），同样的算法用 NetworkX 的 `steiner_tree` 近似或多源最短路径即可实现；只有表数超过 100 且 Spec 03 的干扰表压测显示路径查找成为瓶颈时才启动。
 - **歧义判定只看步数相同的候选**：步数不同但语义也不同的路径（如行业直达与经客户）不会被判为歧义，靠 Spec 05 维度的默认路径和口径标注兜住。
 - **开放决策（需用户确认）**：
   1. Join 关系确认人（1.4）是谁；`confirmed_by` 填真实姓名还是账号。

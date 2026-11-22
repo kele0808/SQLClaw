@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 2、3）。4.3 影响分析额外列出受影响的问答样例（Spec 05 S9，不写 STALE 标记）；`metadata.sync_and_diff` 在结构变化后入队 `metadata.value_index`（Spec 02 M10）。均属 **MVP**。
 - 对应架构文档：17.5（多轮对话）、9.6（口径标注上的修改）、5.1/5.2/5.5/16.1/16.2 的 MVP 修订（手动 Diff、STALE、发布与回滚、门禁）、第二十章（API）、第二十一章（MVP 部署）、22.2（MVP 验收）、第二十三章（第 6 周）
 - 依赖：Spec 01（API 骨架、队列、Compose）、Spec 02（快照、身份、release 与指针、`move_pointer`、STALE）、Spec 03（评测运行与判定）、Spec 04/05（依赖关系、`build_candidate_release`）、Spec 06（`IREditOp`、`apply_edits`）、Spec 07（鉴权、审计）、Spec 08（`run_query`、`QueryResponse`、`Clarification`、`query_execution`、LLM 接口）
 - 被依赖：无（MVP 最后一个子项目）
@@ -177,7 +179,12 @@ class RenameMapping:              # metadata_rename_mapping 的一行
 
 def diff_snapshots(old: SchemaSnapshot, new: SchemaSnapshot,
                    renames: Sequence[RenameMapping] = ()) -> list[SchemaChange]: ...
-def analyze_impact(changes: Sequence[SchemaChange], bundle: ReleaseBundle) -> list[ImpactItem]: ...
+@dataclass(frozen=True)
+class ImpactReport:                     # 2026-11-22：原返回 list[ImpactItem]，增加样例清单
+    items: tuple[ImpactItem, ...]
+    affected_examples: tuple[tuple[str, str], ...]   # (example_id, 原因：依赖的 object_key)
+
+def analyze_impact(changes: Sequence[SchemaChange], bundle: ReleaseBundle) -> ImpactReport: ...
 ```
 
 - 对比基准：当前活跃 release 的快照（不是上一份快照），因为 STALE 的意义是"活跃 release 中哪些对象已不可信"。
@@ -188,13 +195,15 @@ def analyze_impact(changes: Sequence[SchemaChange], bundle: ReleaseBundle) -> li
   - 语义对象：`SemanticModel.dependencies()`（Spec 05）。
   - 字段注解与枚举：对应字段。
   - 传递：依赖于被标记边或指标的对象（如引用该边的维度、引用该指标的比率）→ `DEPENDS_ON_STALE`。
+  - 问答样例（2026-11-22，Spec 05 S9）：依赖了被标记指标或维度的样例列入 `ImpactReport.affected_examples`（样例 ID 与原因），**不**写 `metadata_stale_mark`（样例不是 Spec 02 的 `ObjectType`），因为样例的可用性本来就在加载时按依赖实时计算（Spec 05 4.9）；列出来是为了提醒样例 owner 复核或修改。
+  > 参考：架构 17.2"历史 SQL 依赖变化时标记失效、重新验证"；[WrenAI](https://github.com/Canner/WrenAI) 的 SQL pairs 随 MDL 部署重建索引。
 - 每个影响项调用 `mark_stale(source="SCHEMA_DIFF", change_event_id=…)`（Spec 02）；被删除的表与字段本身也标记。新增类变化不产生 STALE。`COMMENT_CHANGED` 且新注释被注入检测命中时，不产生 STALE，但在变更列表中标出"注释待复核"。
 
 **`metadata_change_event`**：`id`；`datasource_id`；`from_snapshot_id`；`to_snapshot_id`；`kind`；`object_type`；`object_key`；`before JSONB`；`after JSONB`；`breaking BOOLEAN`（是否产生了 STALE）；`created_at`；`trace_id`。迁移给 `metadata_stale_mark.change_event_id` 加外键（Spec 02 预留）。同一对 `(from_snapshot_id, to_snapshot_id)` 重新 Diff 时，先删除旧事件再写入（事件表是可重算的派生数据）。
 
 **`metadata_rename_mapping`**：`id`；`datasource_id`；`object_type`；`old_key`；`new_key`；`created_by`；`created_at`。
 
-队列任务 `metadata.sync_and_diff`（payload 同 Spec 02 的 `metadata.sync`）：采集保存快照 → 快照有变化（`unchanged = false`）且存在活跃 release 时执行 Diff、写事件、标记 STALE → 任务摘要（变更数、STALE 数、新快照 ID）写入日志（带任务的 `trace_id`）；变更明细通过 `GET /api/v1/metadata/changes` 查询。Spec 01 的 `jobs` 表不存放任务结果，本 Spec 不为此修改队列。
+队列任务 `metadata.sync_and_diff`（payload 同 Spec 02 的 `metadata.sync`）：采集保存快照 → 快照有变化（`unchanged = false`）且存在活跃 release 时执行 Diff、写事件、标记 STALE → 快照有变化时入队 `metadata.value_index`（Spec 02 4.11，`requested_by` 沿用本任务）→ 任务摘要（变更数、STALE 数、受影响样例数、新快照 ID）写入日志（带任务的 `trace_id`）；变更明细通过 `GET /api/v1/metadata/changes` 查询。Spec 01 的 `jobs` 表不存放任务结果，本 Spec 不为此修改队列。
 
 ### 4.4 D3 发布与回滚（架构 5.5、16.1 修订）
 
@@ -283,6 +292,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 11. `docker compose -f deployment/compose.yaml --profile app up -d` 后 `/readyz` 返回 200，页面可以完成一次查询。
 12. D7：两个版本的 MVP 验收报告已归档。
 13. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
+14. （2026-11-22）验收 5 的场景中，依赖 `department` 维度的问答样例出现在 `ImpactReport.affected_examples`，且该样例在新 release 上不可用（Spec 05 4.9）；`sync_and_diff` 在快照变化后入队一条 `metadata.value_index` 任务，结构不变时不入队。
 
 ## 6. 新增依赖
 

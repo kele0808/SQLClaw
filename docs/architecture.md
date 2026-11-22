@@ -32,6 +32,7 @@
 6. **新增 Prompt 注入与数据出境**（11.6、2.1）。元数据、样本、错误信息、结果进入模型前要做隔离和脱敏；模型选型（境外 API / 国内 / 私有化）作为上线前提。
 7. **新增澄清策略、收紧基数判定**（9.6、6.2）。用"歧义评分 + 默认口径 + 结果口径标注"代替"不确定就问"。"多对一 / 一对一"必须以 PK/UK 约束或人工确认为必要条件，采样只产出候选。
 8. **评测前移、基础设施简化、补齐前置信息**（第十五、二十二、三、八、十七、二十一章，1.3、1.4）。评测从第 1 周并行，新增 50 题验收集；MVP 用 PostgreSQL 兼做任务队列，日志带 trace_id，Redis/Celery/OpenTelemetry 后置；检索按表规模分阶段；MVP 不做查询结果缓存；新增"目标数据库画像"和"组织分工"两张待填表。
+9. **采纳大 Schema 调研的 5 条建议（2026-11-22）**（7.4、8.5、9.6、15.2、17.1、17.2、第二十三、二十四章；调研见 `docs/research/01-text2sql-sota.md`）。评测增加分阶段指标和干扰表规模压测（Spec 03 E9/E10）；新增"问题 → IR"的已验证样例库，依赖失效时自动不可用（Spec 05 S9）；新增离线值索引，用 PostgreSQL `pg_trgm` 做精确 + 模糊值匹配（Spec 02 M10）；理解阶段生成 3 个 IR 候选、规划后投票，分歧转为澄清（Spec 08 4.5）；为规模化预留表族与公共列、业务域、推断关系证据（Spec 02 M9、Spec 05 S10、Spec 04）。同时在第二十四章记录明确不采纳的做法（微调、大规模 test-time scaling、图数据库等）及原因。
 
 另外修正了原文的几处问题：10.2 的 SQLGlot 示例有逻辑错误（`any()` 作用在生成器对象上恒为真，会拒绝所有 SQL），已修正并实测；10.2 和 12.2 被压成一行的代码已恢复换行缩进；5.1、8.2、12.1 三张流程图在原文中只剩标题，已根据所在章节和相关章节的文字重画为 mermaid 图；第二章、第十六章排版错乱的标题已整理。
 
@@ -1018,6 +1019,12 @@ Semantic Evolution
 - 指标定义文件放在版本库中（YAML），审核走 Pull Request：定义人提交、审核人批准即 VERIFIED，变更记录可追溯。
 - 监控：VERIFIED 指标数、DRAFT 积压数、平均审核时长、按 DRAFT 口径执行的查询占比。
 
+**修订（2026-11-22）：** 表数上百后，人工写 YAML 本身会成为瓶颈（调研 §3.3：业界的共同做法是"LLM 起草、人确认"）。因此：
+
+- MVP 起所有语义对象带可选的 `domain`（业务域），`model.yaml` 声明域与表的对应，为 8.5 阶段 B/C 的按域检索预留（Spec 05 S10；参考 Uber QueryGPT 的 workspaces）。
+- MVP 起把审核过的"问题 → IR"样例放进同一目录、同样走 PR（Spec 05 S9，见 17.2 修订）。
+- 阶段 2 提供"LLM 起草 DRAFT 语义对象"：根据快照、Join Graph、值索引生成 DRAFT 的指标/维度/术语与样例，**只能**经人工修改和 PR 审核后进入正式目录（Spec 05 §2.2；参考 dbt 2026 的"LLM 提议最少建模"）。DRAFT 的使用规则不变（7.2 修订）。
+
 # **八、Hybrid RAG：数据库知识检索**
 
 RAG 的任务不是直接生成 SQL，而是为 Planner 提供正确、精简、可追溯的知识。
@@ -1124,6 +1131,14 @@ Level 3: Required Columns + Business Rules + Examples
 | C | 更大规模或多库 | 增加 BGE Reranker，按业务域分区检索 |
 
 无论哪个阶段，Join Graph Expansion 都保留：选中的表之间缺少连接表时，自动补入路径上的中间表。进入模型上下文的元数据都按 11.6 做隔离和脱敏。
+
+**修订（2026-11-22）：** 阶段 A 补充三项低成本手段，仍然不需要 Embedding（Spec 02、05、08）：
+
+- **值索引**：离线取非敏感、非键、低基数文本列的 distinct 值（按租户存储），用 PostgreSQL `pg_trgm` 做精确 + 模糊匹配，解决"华东区""华东精密"这类值链接问题（Spec 02 M10；参考 CHESS 的 LSH 值索引、supersonic 的维度值词典）。这是 17.1 Data Profiling 之外唯一读业务行的元数据采集。
+- **已验证样例召回**：相似问题的已审核 IR 作为 few-shot（Spec 05 S9、Spec 08 A3；参考 WrenAI SQL pairs、DAIL-SQL）。
+- **上下文压缩**：一级摘要按表族折叠分表/备份表，审计列只列一次（Spec 02 M9；参考 ReFoRCE、DBCC）。
+
+**阶段升级改为由数据触发**，不再只凭表数判断。满足任一条件时启动阶段 B：Spec 03 E10 干扰表压测中 N = 500 的 `table_recall_at_8` < 0.90，或 `execution_accuracy` 比 N = 0 下降超过 5 个百分点；真实库评测中 `failure_stage = RETRIEVAL` 的失败占比超过三分之一；1.3 画像的表数超过 300。阶段 C 的"按业务域分区"使用 Spec 05 的 `domain` 字段。
 
 # **九、Query Planner：不要直接让 LLM 写 SQL**
 
@@ -1388,6 +1403,8 @@ Planner 和 SQL Compiler 的输入除了 IR，还包括当前 `metadata_release_
 用户可以直接在标注上修改（例如"改为按完成时间"），触发一次多轮修改（17.5）。
 
 **监控：** 澄清率、澄清后放弃率、用户修改默认口径的比例。修改比例高的默认口径要回到语义层重新审核。
+
+**修订（2026-11-22）：** 增加一个歧义来源——**理解结果不一致**。理解阶段生成 3 个 IR 候选，经确定性规划后按规范化哈希投票：多数一致就执行；不一致且分歧只在指标或 Join 角色上时，转成上表的"指标口径"或"Join 角色"澄清；其他分歧执行第一个候选并加警示（Spec 08 4.5；参考 supersonic 的 self-consistency、MCS-SQL）。一致率同时作为评测中的置信度信号（Spec 03 E9）。这不是大规模 test-time scaling：候选数固定为 3，不引入选择模型（第二十四章"不采纳"）。
 
 # **十、SQL Generation & Validation**
 
@@ -2071,6 +2088,10 @@ Agent 可以总结：
 | Clarification Accuracy（修订新增） | 该澄清的是否澄清了，不该澄清的是否没有澄清 |
 | Fallback Ratio（修订新增） | 走兜底通道的比例，以及兜底通道的准确率 |
 | Bypass Block Rate（修订新增） | 绕过测试集拦截率，要求 100% |
+| Table Recall\@K / Strict Recall（2026-11-22） | 检索结果前 K 张表对标注表的召回；strict 为"一张不漏"的题占比（Spec 03 E9，参考 RSL-SQL） |
+| Failure Stage（2026-11-22） | 每道失败题归因到检索 / 理解 / 执行 / 结果中第一个出错的阶段 |
+| Candidate Agreement（2026-11-22） | 多候选 IR 的一致率，及按一致率分组的准确率 |
+| Scale Curve（2026-11-22） | 加入 0 / 100 / 500 张干扰表后准确率与召回的变化（Spec 03 E10），作为 8.5 阶段升级的依据 |
 
 其中最重要的是 Execution Accuracy 和 Semantic Accuracy。
 
@@ -2220,6 +2241,8 @@ DDL / Business Rule Change
 
 **修订：** Data Profiling 放到阶段 2（第 7～10 周）。MVP 只采集 PK/UK、索引和表行数估计等低成本信息；数据画像产出的关联键匹配率只能作为候选边的证据，不能单独决定基数（6.2）。
 
+**修订（2026-11-22）：** 一个例外进入 MVP：**值索引**（Spec 02 M10）。它只取低基数文本列的 distinct 值（单列超过 5000 个值即放弃），跳过键列、敏感名称与注释的列、超大表和没有租户列的表，每列一条带服务端超时的查询；不计算空值率、分布等画像。值按租户存储、检索时强制按租户过滤，因为它是业务库之外的副本，不受数据库层租户隔离保护（11.1）。推断出的关联证据（`VALUE_INCLUSION` 等）仍属阶段 2，且只能生成 CANDIDATE 边（Spec 04）。
+
 ## **17.2 SQL Example Management**
 
 历史 SQL 是非常有价值的知识。
@@ -2249,6 +2272,13 @@ DDL / Business Rule Change
 2. 标记失效。
 3. 重新验证。
 4. 通过后再恢复检索。
+
+**修订（2026-11-22）：** 样例管理提前到 MVP，但存储的是"问题 → **IR**"而不是"问题 → SQL"（Spec 05 S9）：
+
+- 样例是 `semantic_definitions/<model>/examples/*.yaml`，与指标同样走 PR 审核（定义人 ≠ 审核人）；可以从一次成功查询导出为 DRAFT（Spec 08 `export-example`）。
+- 依赖从 IR 语法上取得（引用的指标、维度、列，再加上它们自己的依赖），上面的第 2 步"标记失效"由 STALE 标记自动完成：任一依赖被标记 STALE 或废弃，样例在检索时立即不可用；Spec 09 的影响分析列出受影响样例提醒 owner。
+- 存 IR 的原因：IR 经确定性规划，schema 有兼容变化时样例自动适配新 release；SQL 样例则需要逐条重写。`release build` 会编译每个 VERIFIED 样例，编不过的不能进入 release。
+- 参考：WrenAI 的 SQL pairs、Vanna 的问答对记忆、supersonic 的 exemplar、DAIL-SQL 对样例选择的研究。
 
 ## **17.3 Views 和复杂 SQL**
 
@@ -2770,12 +2800,12 @@ Docker Compose（MVP）
 
 | 周 | 主线开发 | 评测与组织（并行） | 周末交付 |
 | --- | --- | --- | --- |
-| 第 1 周 | 工程骨架（FastAPI + LangGraph 空图）；MySQL 元数据采集（Table / Column / Index / PK / UK / FK、数据库版本）；Schema Snapshot 存入 PostgreSQL；结构化日志带 `trace_id` | **填写目标数据库画像（1.3）**；落实组织分工（1.4）；数据出境与模型选型结论（11.6）；收集真实问题，标注前 10 道验收题 | 元数据快照可查询；画像与分工表填完 |
+| 第 1 周 | 工程骨架（FastAPI + LangGraph 空图）；MySQL 元数据采集（Table / Column / Index / PK / UK / FK、数据库版本）；Schema Snapshot 存入 PostgreSQL；结构化日志带 `trace_id`；表族与公共列、值索引（2026-11-22，Spec 02 M9/M10） | **填写目标数据库画像（1.3）**；落实组织分工（1.4）；数据出境与模型选型结论（11.6）；收集真实问题，标注前 10 道验收题 | 元数据快照可查询；画像与分工表填完 |
 | 第 2 周 | Join Graph 数据模型；由 FK / PK / UK 生成候选边；人工确认工具（脚本或简单页面）；VERIFIED 子图上的 Join Path Finder + 扇出检测 | 标注到 25 道题；首批 10～20 个核心指标进入定义流程（7.4） | 任意验收题都能在 VERIFIED 子图上给出 Join 路径 |
-| 第 3 周 | 语义层（指标、维度、术语、状态机，YAML + PR 审核）；Query IR v2（聚合、过滤、时间、比率、Top-N）；版本感知的 SQL Compiler（10.1） | 标注到 40 道题；评测 Runner 跑通（执行结果比较） | IR → SQL 端到端可用，评测有第一版分数 |
+| 第 3 周 | 语义层（指标、维度、术语、状态机，YAML + PR 审核；业务域与样例格式，2026-11-22）；Query IR v2（聚合、过滤、时间、比率、Top-N）；版本感知的 SQL Compiler（10.1） | 标注到 40 道题；**开工前标注 IR 可表达性**（2026-11-22，Spec 06 Q9）；评测 Runner 跑通（执行结果比较，含分阶段指标字段） | IR → SQL 端到端可用，评测有第一版分数 |
 | 第 4 周 | Validator（AST、对象存在性、语义、扇出、权限、成本）；Execution Gateway（只读副本、租户账号/视图、超时、禁止 EXPLAIN ANALYZE、脱敏、审计）；**绕过测试集进 CI** | 50 道验收题标注完成；第一批指标完成审核 | 安全执行链路可用 |
-| 第 5 周 | LangGraph 编排全链路：Understanding → Schema 摘要检索 → 歧义评分/澄清 → Planning → Compile → Validate → Execute → Repair；时间偏移、窗口、嵌套；**兜底通道** + `fallback_ratio` | 按失败用例迭代 IR 和语义层 | 50 题全链路评测；口径标注上线 |
-| 第 6 周 | 基础多轮对话（IR 增量修改）；手动触发的 Schema Diff + STALE 标记；Release 发布与回滚；最小 API 与查询页面 | 验收评测；整理失败分类，确定阶段 2 的优先级 | **MVP 验收**（22.2 标准） |
+| 第 5 周 | LangGraph 编排全链路：Understanding → Schema 摘要检索 → 歧义评分/澄清 → Planning → Compile → Validate → Execute → Repair；时间偏移、窗口、嵌套；**兜底通道** + `fallback_ratio`；值索引与样例召回、3 候选投票（2026-11-22） | 按失败用例迭代 IR 和语义层；补齐 ≥ 15 个 VERIFIED 样例；分阶段指标出数（2026-11-22） | 50 题全链路评测；口径标注上线 |
+| 第 6 周 | 基础多轮对话（IR 增量修改）；手动触发的 Schema Diff + STALE 标记；Release 发布与回滚；最小 API 与查询页面 | 验收评测；干扰表规模压测 0 / 100 / 500（2026-11-22，只记录）；整理失败分类，确定阶段 2 的优先级 | **MVP 验收**（22.2 标准） |
 
 **明确不在 6 周内做：** 自动 Schema 演进（Hook、定时 Snapshot、Reconciliation）、自动推断 Join 关系、数据画像、向量检索与重排、查询结果缓存、Redis / Celery、OpenTelemetry / Grafana、自动图表、跨库查询。
 
@@ -2783,7 +2813,7 @@ Docker Compose（MVP）
 
 | 阶段 | 时间（参考） | 重点 |
 | --- | --- | --- |
-| 阶段 2：稳定与扩展 | 第 7～10 周 | Benchmark 扩充到 200 题以上；按兜底原因扩展 IR；数据画像与采样生成候选边（17.1）；Migration Hook + 定时 Snapshot + 每日 Reconciliation（5.3）；依赖图与自动增量构建（5.4）；结果量级校验；SQL Example 管理（17.2） |
+| 阶段 2：稳定与扩展 | 第 7～10 周 | Benchmark 扩充到 200 题以上；按兜底原因扩展 IR；数据画像与采样生成候选边（17.1）；Migration Hook + 定时 Snapshot + 每日 Reconciliation（5.3）；依赖图与自动增量构建（5.4）；结果量级校验；LLM 起草 DRAFT 语义对象（7.4 修订）；推断关系证据生成候选边（Spec 04） |
 | 阶段 3：规模化 | 第 11～16 周 | 按召回率决定是否启用检索阶段 B / C（8.5）；OpenTelemetry + 看板；PG 队列不够用时引入 Celery / Redis；扩展更多业务域指标；Benchmark 扩充到 500 题；压测 |
 | 阶段 4：平台化 | 第 16 周以后 | 多数据源、PostgreSQL 方言；安全评审通过后考虑结果缓存（17.6）；自动图表；Self-Evolving（只产出改进建议，评测 + 人工审批后发布，25.1）；Agentic Analytics 试点（25.3） |
 
@@ -2861,6 +2891,23 @@ Docker Compose（MVP）
 | 评测 | Execution + Semantic + Safety | 第 1 周启动；50 题验收集；Fallback / 澄清指标 |
 | 观测 | OpenTelemetry | MVP 用结构化日志 + trace_id；阶段 3 引入 |
 | 部署 | Docker Compose | MVP 精简组件 |
+| 值链接（2026-11-22） | — | 离线值索引（PG `pg_trgm`，按租户），实体解析先查索引再经网关确认 |
+| 样例记忆（2026-11-22） | SQL Example | 存"问题 → IR"，PR 审核，依赖 STALE 时自动不可用 |
+| 理解稳定性（2026-11-22） | — | 3 个 IR 候选，规划后按规范化哈希投票，分歧转澄清 |
+| 评测分解（2026-11-22） | — | 分阶段指标 + 干扰表规模压测；8.5 阶段升级由数据触发 |
+| 规模化预留（2026-11-22） | — | 表族与公共列、业务域 `domain`、推断关系证据只生成 CANDIDATE |
+
+**调研后明确不采纳的做法（2026-11-22）**，原因详见 `docs/research/01-text2sql-sota.md` §5：
+
+| 不采纳 | 原因 |
+| --- | --- |
+| 微调或强化学习训练模型（SQLCoder、OmniSQL、Arctic-Text2SQL-R1、Reasoning-SQL 等） | 收益主要在 BIRD 等小 schema 基准上；需要训练数据与 GPU；与第三章"第一阶段不训模型"一致；本项目的主要难点是语义和规模，不是 SQL 语法 |
+| 大规模 test-time scaling（CHASE-SQL、Agentar-Scale-SQL 的几十个候选 + 选择模型） | 成本与延迟不适合交互式产品；k = 3 的结构投票（9.6 修订）预计拿到大部分收益（推断，第 5 周实测） |
+| MAC-SQL 式"把整库 schema 交给 LLM 剪枝" | 几百张表时放不进上下文，且漏召不可控；我们用确定性检索 + 表召回指标 |
+| 无约束的 agent 自由探索（单一 `execute_sql` 工具循环，如 Spider-Agent） | 违反 Execution Gateway 的安全边界，生产库上有成本与泄露风险；目标是可治理，不是刷榜 |
+| 引入图数据库（QueryWeaver / FalkorDB）或知识图谱存储 | NetworkX + PostgreSQL 已足够；QueryWeaver 为 AGPL；其最短路径补表的思路可在现有 Join Graph 上实现（Spec 04 §7） |
+| CHESS 的 LLM 单元测试（Unit Tester）选候选 | IR 路径的 SQL 由确定性编译产生，正确性靠规划器、快照测试和执行结果评测；LLM 生成单测收益低、成本高 |
+| 照搬 tianyuqic1/Text2Sql 等小型仓库 | 无许可证、单次提交、设计不比现有 spec 完整 |
 
 # **二十五、我认为还可以进一步研究的三个方向**
 

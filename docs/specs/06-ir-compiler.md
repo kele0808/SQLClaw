@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 4、5 与 §3.3）。4.2 新增公开函数 `canonical_ir_hash()`，供 Spec 08 多候选 IR 投票；新增 Q9「开工前的 IR 可表达性标注」（结果写入 Spec 03 题目字段 `ir_expressibility`）；§7 记录阶段 2 的替代方案"LLM 在语义视图上写 SQL、由 SQLGlot 展开"。`canonical_ir_hash` 与 Q9 属于 **MVP**，替代方案属于**阶段 2**（是否启用以评测数据决定）。
 - 对应架构文档：第九章（9.1、9.1.1、9.2、9.3、9.5、9.6 的默认口径部分）、10.1（版本能力矩阵）、10.3（扇出 / 比率 / 边校验在编译期的落实）、6.5（预聚合）、14.3（结果血缘）、17.5（IR 增量修改）、17.6（编译缓存）、第二十三章（第 3 周、第 5 周）
 - 依赖：Spec 02（`StaleSet`、对象键）、Spec 03（验收集 `expected_ir`、标注约定、`Predictor` 协议）、Spec 04（`JoinGraph`、`JoinStep`、`tree_from_edges`、`connect_tables`）、Spec 05（`ReleaseBundle`、`SemanticModel`）
 - 被依赖：07（编译产物要通过网关校验；能力矩阵复用）、08（LLM 产出 IR，规划结果决定澄清/兜底/修复）、09（多轮 IR 增量修改）
@@ -24,6 +26,7 @@
 | Q6 | `GoldIrPredictor`（评测用）与编译缓存 | 第 3 周 |
 | Q7 | 时间偏移（同比/环比）、派生指标、窗口、组内 Top-N、嵌套 | 第 5 周 |
 | Q8 | IR 增量修改操作（多轮与澄清共用） | 第 5 周 |
+| Q9 | IR 可表达性标注（2026-11-22 新增）：编译器开工前，对 50 题逐题判断 IR v2 能否表达 | 第 3 周开工前 |
 
 ### 2.2 本期不做
 
@@ -188,6 +191,17 @@ class QueryIR(BaseModel):
 - 字段名与架构 9.1.1 示例一致；该示例 JSON 能被本模型解析（验收标准 1）。`dimensions` 中的字符串在解析后统一转为 `DimensionRef(id=…)`。
 - `assumptions` 以规划器输出为准：规划时清空输入中的 `assumptions` 再重新生成，LLM 不能自行"声明"口径。
 - `QueryIR.model_json_schema()` 供 Spec 08 放进提示词，作为结构化输出约束。
+
+**IR 规范化哈希**（2026-11-22 新增，`text2sql.planner.query_ir`）：
+
+```python
+def canonical_ir_hash(ir: QueryIR) -> str: ...   # sha256 十六进制
+```
+
+- 输入应为**规划后**的 IR（`Planned.ir`：默认口径、默认 Join 角色、时间字段已补齐），这样"LLM 省略了默认值"和"LLM 显式写出默认值"得到同一哈希。
+- 计算前去掉只影响展示或说明的字段：`assumptions`、`Filter.labels`、`clarification`、`fallback.detail`；`metrics`、`dimensions`、`filters`、`having` 视为集合（按各自规范化 JSON 排序）；`sort`、`window`、`time_offsets` 保持顺序（顺序有语义）。然后 `json.dumps(sort_keys=True, ensure_ascii=False, separators=(",", ":"))` 取 sha256。
+- 用途：Spec 08 4.5 的多候选一致性投票、Spec 03 的 `candidate_agreement`。4.11 编译缓存的键仍用完整规范化 JSON（含 `labels`），两者不混用。
+  > 参考：[supersonic](https://github.com/tencentmusic/supersonic) 的 `parser.self-consistency` 对多次解析结果按结构投票；[CHASE-SQL](https://arxiv.org/abs/2410.01943) 用多候选 + 选择提升准确率。我们在**结构化 IR** 上投票，比较的是确定性规划后的结构，不需要选择模型。
 
 ### 4.3 Q8 IR 增量修改（`text2sql.planner.ir_edit`）
 
@@ -513,6 +527,15 @@ def capability_violations(tree: exp.Expression, caps: Capabilities) -> list[str]
 - IR 夹具 `tests/fixtures/ir/*.json` 覆盖每一类算子；每个夹具在 `mysql57`、`mysql80` 下各有一个期望 SQL 快照（`--update-snapshots` 重新生成，变更需在 PR 中审阅）。
 - 集成测试：对合成库执行编译结果，与手写 SQL 结果用 Spec 03 的 `compare_results` 比对；同一 IR 在 5.7 与 8.0 上的结果必须一致。
 
+### 4.13 Q9 IR 可表达性标注（2026-11-22 新增）
+
+第 3 周编译器开工前完成：
+
+- 对验收集每道 ANSWER 题，由编译器作者与评测集审核人按 IR v2（4.2）判断并在题目 YAML 写入 `ir_expressibility`（Spec 03 4.4）：`EXPRESSIBLE`（能写出 `expected_ir`）、`FALLBACK_EXPECTED`（需要 IR 之外的算子，写明原因类别，对应 `FallbackInfo.reason`）。
+- 判定门槛：若 `FALLBACK_EXPECTED` 超过 ANSWER 题的 20%，先评审 IR 是否缺少常见算子（可能在第 3 周补字段），或是否提前评估 §7 的替代方案；不满足门槛也不阻塞开工，但结论记入 `docs/acceptance/ir-expressibility-<日期>.md`。
+- 原因：IR 路线的主要风险是覆盖不足（研究报告 §3.3：IR 类方法在 Spider 2.0 上没有可比数据；`fallback_ratio` 只能在第 5 周才测到）。提前标注把这个风险前移到写代码之前。
+  > 参考：架构修订说明第 2 条"IR 的设计由 Benchmark 题目反推"；[NatSQL](https://arxiv.org/abs/2109.05153)、[IRNet/SemQL](https://arxiv.org/abs/1905.08205) 都报告过中间表示对部分 SQL 不可表达的问题。
+
 ## 5. 验收标准
 
 第 3 周：
@@ -536,6 +559,8 @@ def capability_violations(tree: exp.Expression, caps: Capabilities) -> list[str]
 通用：
 
 13. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
+14. （2026-11-22）`canonical_ir_hash`：指标/维度/过滤顺序不同、`labels` 或 `assumptions` 不同的两个 IR 哈希相同；`sort` 顺序不同、过滤值不同、Join 角色不同的哈希不同（单元测试）。
+15. （2026-11-22，第 3 周开工前）所有 ANSWER 题都有 `ir_expressibility`，`docs/acceptance/ir-expressibility-<日期>.md` 已提交。
 
 ## 6. 新增依赖
 
@@ -547,6 +572,8 @@ def capability_violations(tree: exp.Expression, caps: Capabilities) -> list[str]
 - **偏移与时间分桶不能同时使用**（如"按月对比今年与去年"）：当前期与偏移期的时间键不同，需要键对齐逻辑。MVP 返回 `Unsupported` 进兜底，并由 `fallback_ratio` 统计频率，作为阶段 2 扩展 IR 的依据（架构 9.4）。
 - **5.7 的窗口改写成本**：关联子查询在聚合结果上计算，行数大时（例如按员工 × 天分组）会变慢；EXPLAIN 成本检查（Spec 07）兜底。
 - **路径提升可能引入未经标注的口径**：只在 FORWARD 链唯一时自动提升；FORWARD 是多对一，不改变计数，但"处理记录按工单行业统计"的口径不会单独标注。若评测发现用户理解偏差，再增加一种 assumption。
+- **阶段 2 的替代方案：LLM 在语义视图上写 SQL，由 SQLGlot 展开**（2026-11-22 记录，MVP 不做）。做法：把每个语义模型（锚表 + 默认过滤 + 维度路径）编译成一个"语义视图"的虚拟表定义；LLM 对这些虚拟表写 SQL（列即指标与维度），系统用 SQLGlot 把虚拟表引用展开成本 Spec 生成的派生表，再走 Spec 07 全量校验。优点是表达力接近 SQL（窗口、任意嵌套、会话切分），口径仍来自语义层；缺点是失去 IR 的结构化澄清与增量修改（Q8），校验粒度变粗。**启用条件**：第 5 周后 `fallback_ratio` 持续 > 15%，或 Q9 标注的 `FALLBACK_EXPECTED` 占比 > 20%，且失败集中在 IR 难以扩展的算子上。届时作为与 IR 并行的第二条通道评测，不替换 IR。
+  > 参考：[WrenAI](https://github.com/Canner/WrenAI) 让 LLM 对 MDL 语义模型写 SQL，再由 wren-engine 展开成物理 SQL；[dbt 2026：语义层 vs Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026) 的对照实验；[data.world 基准](https://arxiv.org/abs/2311.07509) 中加语义层后准确率从 16% 提升到 54%。
 - **`business_timezone` 默认 `Asia/Shanghai`** 是基于用户所在时区的假设；真实业务库 `DATETIME` 的时区语义属于 1.3 待填项（开放决策）。
 - **开放决策（需用户确认）**：
   1. "最近 N 天"包含今天（本 Spec 的选择）还是不含今天。

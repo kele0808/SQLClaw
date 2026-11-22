@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 1～4）。A3 检索增加值索引命中、问答样例召回、表排序与命中来源（供 Spec 03 分阶段指标），一级摘要按表族折叠（4.4）；A4 用样例做 few-shot，并生成 k 个 IR 候选、规划后按 `canonical_ir_hash` 投票（4.5）；A5 先查 Spec 02 值索引再经网关确认（4.6）；A6 增加"候选分歧"来源（4.7）；状态、持久化、`AgentPredictor` 相应扩展；新增 CLI `export-example`。以上均属 **MVP**（第 5 周）。依赖 Spec 02 M9/M10、Spec 05 S9、Spec 06 `canonical_ir_hash`。
 - 对应架构文档：第十二章（12.1～12.3）、8.4/8.5（Schema 摘要 + 关键词检索，阶段 A）、9.4（兜底通道）、9.6（歧义评分与澄清）、第十三章（修复）、第十四章（结果校验与血缘）、11.6（Prompt 注入与上下文最小化）、2.1（信任边界）、3（模型接入层可替换）、第二十三章（第 5 周）
 - 依赖：Spec 01（LangGraph 挂载点、`trace_id`、队列）、Spec 02（release 指针、`StaleSet`、`mark_stale`、`comment_visible`）、Spec 03（`Predictor`、`Prediction`）、Spec 04（`connect_tables`）、Spec 05（`ReleaseBundle`、术语、实体查找维度、`build_candidate_release`）、Spec 06（`QueryIR`、`compile_ir`、`PlanError`、`IREditOp`、`Assumption`、`MetricLineage`）、Spec 07（`Gateway`、`Principal`、`GatewayError`、`ErrorCategory`）
 - 被依赖：09（HTTP API、多轮续问、页面）
@@ -18,10 +20,10 @@
 | --- | --- | --- |
 | A1 | LLM 接口 | `LLMProvider` 协议、结构化输出、用量记录；`fake` 与 `openai_compatible` 两个实现 |
 | A2 | 上下文构建与净化 | 指令/数据分区、注释复核过滤、敏感字段只给名称类型、错误信息净化 |
-| A3 | 检索 | Schema 摘要（三级上下文）+ 关键词/同义词匹配 + Join Expansion |
-| A4 | 理解 | LLM 输出 `UnderstandingOutput`（意图、IR 草稿、术语与实体提及） |
-| A5 | 实体解析 | `entity_lookup` 维度经网关查询，处理重名 |
-| A6 | 歧义评分与澄清 | 9.6 的规则；每轮最多一问、最多 3 个选项、默认选项 |
+| A3 | 检索 | Schema 摘要（三级上下文，表族折叠）+ 关键词/同义词匹配 + 值索引命中 + 问答样例召回 + Join Expansion；输出表排序与命中来源 |
+| A4 | 理解 | LLM 输出 `UnderstandingOutput`（意图、IR 草稿、术语与实体提及）；样例 few-shot；k 个候选规划后投票 |
+| A5 | 实体解析 | 先查值索引（含模糊名称）得到候选名称，再对 `entity_lookup` 维度经网关查询确认键值，处理重名 |
+| A6 | 歧义评分与澄清 | 9.6 的规则；每轮最多一问、最多 3 个选项、默认选项；候选 IR 分歧也作为歧义来源 |
 | A7 | 兜底通道 | 受限上下文生成 SQL，全量校验，`plan_mode = FALLBACK_SQL` |
 | A8 | 修复 | 错误分类后有限修复（最多 2 次），优先改 IR |
 | A9 | 结果校验与血缘 | 14.1 修订的规则、14.3 血缘 |
@@ -93,6 +95,9 @@ tests/integration/agent/…
 | `max_repair_attempts` | `T2S_MAX_REPAIR_ATTEMPTS` | `int` | `2` |
 | `agent_deadline_s` | `T2S_AGENT_DEADLINE_S` | `int` | `90` |
 | `llm_explain_results` | `T2S_LLM_EXPLAIN_RESULTS` | `bool` | `False` |
+| `understanding_samples` | `T2S_UNDERSTANDING_SAMPLES` | `int`（1～5） | `3`：A4 生成的 IR 候选数，1 表示关闭投票（2026-11-22） |
+| `understanding_temperature` | `T2S_UNDERSTANDING_TEMPERATURE` | `float`（0～1.5） | `0.7`：第 2 个及以后候选的温度；第 1 个候选固定 0（2026-11-22） |
+| `retrieval_example_k` | `T2S_RETRIEVAL_EXAMPLE_K` | `int`（0～5） | `3`：召回的问答样例数，0 表示不用样例（2026-11-22） |
 
 `openai_compatible` 时 `llm_base_url`、`llm_model` 必填，启动校验。`T2S_ENV=prod` 时禁止 `fake`。
 
@@ -151,6 +156,8 @@ def call_structured(provider: LLMProvider, task: LLMTask, messages: list[LLMMess
 | 表/字段注释 | 只放 `comment_visible()` 为真的注释（Spec 02）；被标记且未复核的注释整体省略 |
 | 敏感字段（`PII`/`SECRET`） | 只给名称与类型，并标注"敏感，禁止输出原值" |
 | 样本值 | 不发送（MVP 不采集样本） |
+| 值索引命中（2026-11-22） | 只发送 Spec 02 M10 对**本问题**检索到的候选（`列键 = 值`，最多 10 条），放在 `id=value_hits` 数据区，注明"候选，未经确认"；值索引本身已排除键列、敏感名称与注释的列，Spec 05 标为 `PII`/`SECRET` 的列从不入索引（是否允许发送见 Spec 02 开放决策 3） |
+| 问答样例（2026-11-22） | 发送召回样例的 `question` 与 `ir`（Spec 05 S9，已经 PR 审核，实体键已为空），放在 `id=examples` 数据区 |
 | 枚举 | 发送语义层中的标签与同义词（已经 PR 审核）；不发送数据库中的实际值分布 |
 | 查询结果 | 不发送（`llm_explain_results = false` 时）；见 4.11 |
 | 数据库错误 | 只发送 Spec 07 的 `safe_detail` |
@@ -159,16 +166,25 @@ def call_structured(provider: LLMProvider, task: LLMTask, messages: list[LLMMess
 ### 4.4 A3 检索（架构 8.5 阶段 A）
 
 ```python
+RetrievalSource = Literal["KEYWORD", "VALUE", "EXAMPLE", "EXPANSION"]   # 2026-11-22
+
 @dataclass(frozen=True)
 class RetrievalResult:
     metrics: tuple[str, ...]          # 命中的指标名
     dimensions: tuple[str, ...]
     terms: tuple[str, ...]            # 命中的术语
     enum_values: tuple[tuple[str, int | str], ...]   # (字段键, code)
-    tables: tuple[str, ...]           # 命中表 + Join Expansion 补入的中间表
+    tables: tuple[str, ...]           # 命中表 + Join Expansion 补入的中间表（截断后，≤ 8）
     matched_text: Mapping[str, str]   # 对象 → 命中的问题片段（调试用）
+    # 2026-11-22
+    value_hits: tuple[ValueHit, ...] = ()        # Spec 02 M10，按 principal 租户检索
+    examples: tuple[str, ...] = ()               # 召回的样例 ID（Spec 05 S9），按相似度降序
+    ranked_tables: tuple[str, ...] = ()          # 全部候选表按分数降序（截断前），供 Spec 03 recall@K
+    scores: Mapping[str, float] = field(default_factory=dict)              # 表 → 分数
+    sources: Mapping[str, tuple[RetrievalSource, ...]] = field(default_factory=dict)  # 对象 → 命中来源
 
-def retrieve(question: str, bundle: ReleaseBundle, stale: StaleSet) -> RetrievalResult: ...
+def retrieve(question: str, bundle: ReleaseBundle, stale: StaleSet, *,
+             tenant_key: str | None, session: Session) -> RetrievalResult: ...   # 2026-11-22：加租户与会话（值索引）
 def build_schema_summary(bundle: ReleaseBundle, stale: StaleSet, *, level: Literal[1, 2, 3],
                          tables: Sequence[str] = ()) -> str: ...
 ```
@@ -178,6 +194,17 @@ def build_schema_summary(bundle: ReleaseBundle, stale: StaleSet, *, level: Liter
 - 召回上限：指标 15、维度 15、表 8。指标与维度总数 ≤ 60 时（合成库为 21）不截断，全部放进理解上下文，并标出命中项；原因是小规模下全量放入成本低、召回最稳（架构 8.5"整库精简摘要"）。
 - Join Expansion：命中表 ≥ 2 张时，以命中表中行数估计最大的表为 root 调用 `connect_tables`（Spec 04），把树上的中间表补入 `tables`。
 - Schema 摘要三级（架构 8.4）：Level 1 每表一行（表名、可见注释、行数量级）；Level 2 加主键、关联边与角色；Level 3 加选中表的全部字段（类型、可空、可见注释、敏感标注）。理解节点只用语义目录；兜底节点用命中表的 Level 3 + 其他表的 Level 1。
+
+2026-11-22 新增（检索仍是确定性的，不调用 LLM）：
+
+- **值索引**：对"去掉已被词典命中片段后的剩余问题文本"调用 Spec 02 `search_values(datasource_id=Settings.datasource_id, tenant_key=str(principal.tenant_id), limit=10)`。命中列若是某维度的 `source.column`（或其键列的标签列）→ 该维度计入命中，来源 `VALUE`；命中列若有枚举定义 → 对应枚举值计入 `enum_values`；命中列所在表计入候选表。数据源还没有值索引构建时跳过本步。**必须**传入 principal 的租户（Spec 02 4.11 的租户隔离由调用方保证）。
+  > 参考：[CHESS](https://arxiv.org/abs/2405.16755) 的"关键词抽取 → LSH 值检索 → 列过滤"；[supersonic](https://github.com/tencentmusic/supersonic) 的维度值映射。
+- **样例召回**：对 `bundle.semantic.examples(stale)`（只含可用的 VERIFIED 样例）计算问题与样例 `question`/`paraphrases` 的字符二元组 Jaccard，取最高的 `retrieval_example_k` 个（相似度 ≥ 0.2）。样例 IR 引用的指标与维度计入命中，来源 `EXAMPLE`（样例提高语义召回，也给 A4 做 few-shot）。
+  > 参考：[WrenAI](https://github.com/Canner/WrenAI) 的 SQL pairs 检索、[Vanna](https://github.com/vanna-ai/vanna) 的问答对记忆、[DAIL-SQL](https://arxiv.org/abs/2308.15363) 的相似样例选择。MVP 用字符二元组而不用 embedding，与 8.5 阶段 A 一致。
+- **表排序**：候选表分数 = 3 × 命中指标/维度以它为锚表或来源表的个数 + 2 × 值命中个数 + 1 × 表名/字段名/注释命中个数 + 1 × 样例引用个数；同分按行数估计降序。`ranked_tables` 记录全部候选（截断前），`tables` 取前 8 张再做 Join Expansion。`sources` 记录每个对象的命中来源。这些字段不影响理解提示词，主要供 Spec 03 E9 计算 `table_recall@K`、定位"检索错还是生成错"。
+  > 参考：[RSL-SQL](https://arxiv.org/abs/2411.00073) 的 strict recall 评估与双向链接；[NL2SQLBench](https://github.com/neurdb/NL2SQLBench) 按模块统计指标。
+- **一级摘要压缩**：Level 1 按 Spec 02 M9 折叠表族（只列代表表，注明"另有 N 张同构表：t_x_2023…"），公共列（如 `created_at`、`is_deleted`）在摘要开头列一次，各表行内不再重复；声明了 Spec 05 `domains` 时按域分组。
+  > 参考：[ReFoRCE](https://arxiv.org/abs/2502.00675) 的同构表分组压缩；[DBCC](https://arxiv.org/abs/2606.28601) 的审计列抽取。
 
 ### 4.5 A4 理解
 
@@ -197,16 +224,33 @@ class UnderstandingOutput(BaseModel):
     entity_mentions: list[EntityMention] = []
 ```
 
-- 提示词给出：语义目录（指标、维度及其路径角色与标签、枚举标签、术语）、默认口径（`defaults.yaml`）、`as_of`、`QueryIR` 的 JSON Schema，以及规则：只能使用目录中的指标与维度；表达不了时把 `plan_mode` 设为 `FALLBACK_SQL` 并填写 `fallback.reason`/`detail`；不确定用哪个口径时不要猜，在 `term_mentions` 中写出术语；实体名称写入 `entity_mentions`，IR 中对应过滤的 `values` 留空。
+- 提示词给出：语义目录（指标、维度及其路径角色与标签、枚举标签、术语）、默认口径（`defaults.yaml`）、`as_of`、`QueryIR` 的 JSON Schema、召回的问答样例（few-shot，2026-11-22）、值索引候选（2026-11-22），以及规则：只能使用目录中的指标与维度；表达不了时把 `plan_mode` 设为 `FALLBACK_SQL` 并填写 `fallback.reason`/`detail`；不确定用哪个口径时不要猜，在 `term_mentions` 中写出术语；实体名称写入 `entity_mentions`，IR 中对应过滤的 `values` 留空。
 - `intent = DATA_MODIFICATION`（删除、修改数据）或 `OUT_OF_SCOPE`（与数据查询无关）→ 状态 `rejected`。
+
+**多候选与一致性投票**（2026-11-22 新增）：
+
+- 生成 `k = understanding_samples` 个 `UnderstandingOutput`：候选 1 用温度 0 和全部召回样例；候选 i（i ≥ 2）用温度 `understanding_temperature`，样例集合去掉第 i−1 个样例（样例不足时只改温度），让候选之间有差异。k 次调用并发执行，每次都受 `call_structured` 的重问规则约束，用量逐次记录（`llm_calls` 计数）。
+- 意图投票：多数候选为 `DATA_MODIFICATION`/`OUT_OF_SCOPE` → `rejected`；否则只保留 `ANALYTICAL_QUERY` 候选。
+- 每个候选分别经 A5 实体解析（同一 `(维度, 原文)` 只查一次）和 Spec 06 规划；规划结果为 `Planned` 的候选计算 `canonical_ir_hash(planned.ir)`（Spec 06 4.2）。
+- 判定：
+  1. 某个哈希的票数 > k/2 → 选它（取该组中编号最小的候选），继续编译执行。
+  2. 无多数，且前两组 IR 只在 `metrics` 上不同 → 记一个 `METRIC_DEFINITION` 歧义项（候选为两组的指标，最多 3 个，`has_default = False`），按 4.7 澄清。
+  3. 无多数，且只在某个维度的 `join_role` 上不同 → 记一个 `JOIN_ROLE` 歧义项。
+  4. 其他无多数情形 → 执行候选 1（若候选 1 未规划成功，取第一个 `Planned` 候选），`warnings` 追加 `LOW_AGREEMENT`："多次理解结果不一致，请核对口径"。
+  5. 没有任何候选规划成功 → 按候选 1 的结果走原有路径（修复 / 兜底 / 失败）。
+- `candidate_agreement` = 被选组票数 / k（k = 1 时为 1.0），写入状态、`query_execution` 和 `Prediction`。
+- 只在第一次理解时投票；修复（A8）和续问（`initial_ir`）不重复采样。
+- 成本：每个问题的理解调用数变为 k（默认 3）。规划与哈希是确定性计算，不额外调用模型。
+  > 参考：[supersonic](https://github.com/tencentmusic/supersonic) 的 `parser.self-consistency`（多次解析投票）；[MCS-SQL](https://arxiv.org/abs/2405.07467) 多提示多候选；[CHASE-SQL](https://arxiv.org/abs/2410.01943) 多候选 + 选择器。我们**不采用**几十个候选 + 选择模型的大规模 test-time scaling（架构第二十四章），只做 k = 3 的结构投票，并把分歧转成澄清而不是硬选。
 
 ### 4.6 A5 实体解析
 
 对每个 `EntityMention`：
 
-- 维度必须声明 `entity_lookup`；构造查找 SQL（SQLGlot 构建，值作为字面量转义）：`SELECT <key>, <label> FROM <source.table> WHERE <label> = '<text>'`（`contains` 时为 `LIKE '%…%'`），附加该表默认过滤，`LIMIT max_candidates + 1`，经 `Gateway.execute` 执行（`plan_mode = "IR"`，同样受租户隔离与审计）。
+- **先查值索引**（2026-11-22）：`search_values(text_value=<原文>, tenant_key=str(principal.tenant_id), columns={<维度标签列键>}, limit=max_candidates)`。有命中时，候选名称 = 命中值（精确命中在前）；用户写简称（"华东精密" → "华东精密有限公司"）也能找到。值索引没有该列或没有命中时，回退到下面原有的 `=` / `LIKE` 查找。
+- 维度必须声明 `entity_lookup`；构造查找 SQL（SQLGlot 构建，值作为字面量转义）：`SELECT <key>, <label> FROM <source.table> WHERE <label> = '<text>'`（`contains` 时为 `LIKE '%…%'`；有值索引候选时为 `<label> IN (<候选名称>)`），附加该表默认过滤，`LIMIT max_candidates + 1`，经 `Gateway.execute` 执行（`plan_mode = "IR"`，同样受租户隔离与审计）。值索引只提供候选名称，**键值始终以网关查询结果为准**（索引可能过期）。
 - 0 个匹配 → 状态 `failed`，消息"未找到名称为 X 的<维度显示名>"，不生成 SQL。
-- 1 个 → 把 IR 中该维度的过滤设为 `values=[key]`、`labels=[名称]`、`match_on="key"`。
+- 1 个 → 把 IR 中该维度的过滤设为 `values=[key]`、`labels=[名称]`、`match_on="key"`；若名称与原文不同（来自模糊命中），`warnings` 追加"'<原文>' 按 '<名称>' 匹配"（2026-11-22）。
 - 多个 → 记一个 `ENTITY_REFERENCE` 歧义项，候选为前 3 个（按键升序），选项标签为"名称（ID 键值）"；MVP 不额外查询其他列来区分重名实体。
 
 ### 4.7 A6 歧义评分与澄清（架构 9.6）
@@ -242,6 +286,7 @@ class Clarification(BaseModel):
 | `METRIC_DEFINITION` | `term_mentions` 中术语的候选 > 1 且 `default` 为空 | 否 | HIGH | 澄清 |
 | `JOIN_ROLE` | 规划返回 `AMBIGUOUS_JOIN_ROLE`（Spec 06：多路径且无默认） | 否 | HIGH | 澄清 |
 | `ENTITY_REFERENCE` | 实体解析多于 1 个 | 否 | HIGH | 必须澄清 |
+| `METRIC_DEFINITION` / `JOIN_ROLE`（2026-11-22） | 多候选投票无多数，且分歧只在指标 / 只在 Join 角色（4.5） | 否 | HIGH | 澄清；选项为分歧的取值 |
 | 时间字段 / 时间范围 / 有默认的角色与术语 | 规划器用默认值并写入 `assumptions` | 是 | — | 不澄清，标注 |
 
 - "影响大小"在 MVP 中按类型固定：上表三类都视为 HIGH。原因：判断"两种理解下结果差异大不大"需要把两种都执行一遍，成本高；而有默认值的歧义已在 Spec 06 中被默认口径吸收，剩下的三类本身就是"没有默认"的情形。
@@ -255,7 +300,7 @@ class Clarification(BaseModel):
 
 进入条件：规划返回 `Unsupported`（含 LLM 在理解阶段声明的 `FALLBACK_SQL`）。
 
-- 允许的表：检索命中表与 Join Expansion 结果（≤ 8 张）；允许的边：这些表之间的全部 VERIFIED 边（边 ID 与列对）。写入 `FallbackInfo.allowed_tables`/`allowed_join_edges`。
+- 允许的表：检索命中表（按 `ranked_tables` 取前 8 张，2026-11-22）与 Join Expansion 结果；允许的边：这些表之间的全部 VERIFIED 边（边 ID 与列对）。写入 `FallbackInfo.allowed_tables`/`allowed_join_edges`。
 - 提示词包含：上述表的 Level 3 摘要、允许的边、默认过滤规则（软删除）、语义层中相关指标的定义文本（让 LLM 复用口径，而不是自创）、目标库版本能力（5.7："不得使用 WITH 与窗口函数"）、`as_of` 与时间约定（Spec 03 4.5 的文本）、禁止项清单、行数上限。输出 `{"sql": str, "summary": str}`。
 - 生成后额外检查：SQL 引用的表 ⊆ `allowed_tables`，否则视为校验失败（类别 `EDGE_NOT_VERIFIED`，阶段 `SEMANTIC`），进入修复。
 - 然后按普通路径交给 `Gateway.execute`（全量校验一项不少）。
@@ -319,7 +364,9 @@ class Text2SQLState(TypedDict, total=False):
     max_rows: int
     deadline_monotonic: float
     retrieval: RetrievalResult
-    understanding: UnderstandingOutput
+    understanding: UnderstandingOutput   # 被选中的候选
+    candidate_agreement: float | None    # 2026-11-22：4.5 投票结果
+    llm_calls: int                       # 2026-11-22：本次查询的模型调用次数（含重问）
     query_ir: QueryIR | None            # 当前 IR（规划前）
     planned_ir: QueryIR | None          # 规划后（含 assumptions）
     compiled: CompiledQuery | None
@@ -346,11 +393,11 @@ State 中不放凭证与连接（架构 12.2）；`ReleaseBundle` 通过 `metada
 ```mermaid
 flowchart TD
     S([问题]) --> CTX[load_context<br/>绑定 release / StaleSet / as_of]
-    CTX --> RET[retrieve<br/>关键词 + Join Expansion]
-    RET --> UND[understand<br/>LLM → IR 草稿]
+    CTX --> RET[retrieve<br/>关键词 + 值索引 + 样例 + Join Expansion]
+    RET --> UND[understand<br/>LLM × k → IR 候选]
     UND -->|修改数据 / 无关| REJ([rejected])
     UND --> ENT[resolve_entities<br/>经网关查找]
-    ENT --> PLN[plan<br/>compile_ir]
+    ENT --> PLN[plan<br/>compile_ir + 候选投票]
     PLN --> AMB{score_ambiguity}
     AMB -->|有歧义| CLR([needs_clarification])
     AMB -->|Compiled| EXE[execute<br/>Gateway]
@@ -379,7 +426,7 @@ flowchart TD
 
 ### 4.13 A11 持久化
 
-**`query_execution`**：`query_id VARCHAR(40)` 主键（`q_` + uuid4 hex）；`conversation_id VARCHAR(40)` 可空（FK 由 Spec 09 添加）；`parent_query_id` 可空；`turn_index INT` 默认 0；`principal_id`；`tenant_id`；`datasource_id`；`release_id`；`question TEXT`；`status`；`plan_mode` 可空；`fallback_reason` 可空；`ir JSONB` 可空（规划后的 IR；未规划成功时为最后一版 IR）；`sql TEXT` 可空；`assumptions JSONB`；`assumption_label TEXT`；`warnings JSONB`；`clarification JSONB` 可空；`lineage JSONB`；`row_count` 可空；`truncated BOOLEAN`；`error_code` 可空；`error_message` 可空（对外文案）；`repair_count`；`llm_input_tokens`；`llm_output_tokens`；`elapsed_ms`；`as_of DATE`；`auto_execute BOOLEAN`；`trace_id`；`created_at`；`finished_at`。
+**`query_execution`**：`query_id VARCHAR(40)` 主键（`q_` + uuid4 hex）；`conversation_id VARCHAR(40)` 可空（FK 由 Spec 09 添加）；`parent_query_id` 可空；`turn_index INT` 默认 0；`principal_id`；`tenant_id`；`datasource_id`；`release_id`；`question TEXT`；`status`；`plan_mode` 可空；`fallback_reason` 可空；`ir JSONB` 可空（规划后的 IR；未规划成功时为最后一版 IR）；`sql TEXT` 可空；`assumptions JSONB`；`assumption_label TEXT`；`warnings JSONB`；`clarification JSONB` 可空；`lineage JSONB`；`row_count` 可空；`truncated BOOLEAN`；`error_code` 可空；`error_message` 可空（对外文案）；`repair_count`；`llm_input_tokens`；`llm_output_tokens`；`llm_calls INT`（2026-11-22）；`candidate_agreement REAL` 可空（2026-11-22）；`retrieval JSONB`（2026-11-22：`ranked_tables`、`examples`、命中的指标/维度名、值命中的**列键**——不存值本身）；`elapsed_ms`；`as_of DATE`；`auto_execute BOOLEAN`；`trace_id`；`created_at`；`finished_at`。
 
 **结果数据不落库**：`run_query` 同步返回数据；`query_execution` 只存元信息。原因：避免在系统库中形成业务数据的第二份拷贝（与架构 17.6 不做结果缓存的理由相同）。
 
@@ -431,14 +478,16 @@ class QueryResponse(BaseModel):
 
 def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None = None,
               release_id: int | None = None, initial_ir: QueryIR | None = None,
-              parent_query_id: str | None = None) -> QueryResponse: ...
+              parent_query_id: str | None = None,
+              allow_distractor_release: bool = False) -> QueryResponse: ...   # 最后一个参数 2026-11-22，仅评测（Spec 03 E10）
 ```
 
 - `datasource_id` 必须等于 `Settings.datasource_id`。`release_id` 为空时取活跃 release（查询全程固定）；评测可指定候选 release。`initial_ir` 非空时跳过检索与理解，直接从实体解析/规划开始（Spec 09 的续问与澄清回答使用）。
 - 状态与 HTTP 无关；Spec 09 负责映射为 API 响应。
 - CLI：`uv run python -m text2sql.agent ask "问题" --user U [--as-of 2026-06-30] [--dry-run]`，以 `principal` 表中该用户身份执行，打印 SQL、结果前 20 行、口径、警告与 `trace_id`。
 - 删除 Spec 01 的 `echo` 节点与临时接口 `POST /api/v1/agent/echo` 及其测试（Spec 01 4.7 约定由本 Spec 删除）。
-- `AgentPredictor`（`name = "agent"`）：用 `Principal(principal_id=0, user_id="eval", tenant_id=题目租户, role="analyst")` 调 `run_query(as_of=题目 as_of, release_id=运行的 release)`；`completed` → `ANSWER`（带结果，Runner 不再执行 SQL）；`needs_clarification` → `CLARIFY`（带澄清类型）；`rejected` → `REJECT`；`failed` → `ERROR`。多轮题在 Spec 09 提供续问前返回 `SKIPPED`。
+- 2026-11-22：CLI `uv run python -m text2sql.agent export-example QUERY_ID --by NAME` 把一条 `completed` 且 `plan_mode = IR` 的 `query_execution` 导出为 Spec 05 S9 的 DRAFT 样例文件（`semantic_definitions/<model>/examples/<id>.yaml`：问题原文 + 规划后 IR，去掉 `assumptions`，实体过滤的 `values`/`labels` 清空），由人修改后提 PR。
+- `AgentPredictor`（`name = "agent"`）：用 `Principal(principal_id=0, user_id="eval", tenant_id=题目租户, role="analyst")` 调 `run_query(as_of=题目 as_of, release_id=运行的 release)`；`completed` → `ANSWER`（带结果，Runner 不再执行 SQL）；`needs_clarification` → `CLARIFY`（带澄清类型）；`rejected` → `REJECT`；`failed` → `ERROR`。多轮题在 Spec 09 提供续问前返回 `SKIPPED`。2026-11-22：`Prediction` 额外填写 `retrieval`（`ranked_tables`、命中指标与维度）、`candidate_agreement`、`llm_calls`、`context_tokens`（理解调用的输入 token 合计）；Spec 03 E10 干扰表压测传入派生数据源（`<datasource_id>__d<N>`）的候选 release 时，`run_query(..., allow_distractor_release=True)` 放行"release 的数据源是 `Settings.datasource_id` 加 `__d<N>` 后缀"的情形（只供评测；值索引与网关仍按真实数据源与题目租户执行；该模式下 `DB_UNKNOWN_TABLE`/`DB_UNKNOWN_COLUMN` 不调用 `mark_stale`，直接按失败计）。
 
 ### 4.15 自然语言类绕过用例（Spec 07 G8 的 `kind: nl`）
 
@@ -461,6 +510,10 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 7. `OpenAICompatibleProvider` 用 `httpx.MockTransport` 测试：请求格式、用量解析、5xx 重试一次、超时；结构化输出解析失败时重问一次。
 8. 用真实模型（满足 11.6 合规结论后配置）在两个版本上运行 `run --predictor agent`：产出完整报告，记录 `execution_accuracy`、`fallback_ratio`、澄清指标、口径标注覆盖率（第 5 周交付"50 题全链路评测"；数值是否达标在第 6 周验收）。
 9. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过；默认测试不访问任何外部模型。
+10. （2026-11-22，检索）值索引中租户 1001 有"华东精密有限公司"时，租户 1001 的问题"华东精密上月的工单数"命中 `customer` 维度（来源 `VALUE`），租户 1002 的同一问题不命中；与某 VERIFIED 样例相近的问题召回该样例并出现在理解请求的 `examples` 数据区；样例依赖的维度被标记 STALE 后不再召回；`ranked_tables` 包含截断前的全部候选；表族成员只在 Level 1 摘要中出现一次（`FakeLLM` 断言请求内容）。
+11. （2026-11-22，投票）`FakeLLM` 脚本：3 个候选中 2 个规划后哈希相同 → 执行多数结果，`candidate_agreement = 2/3`；3 个候选只在指标上各不相同 → `METRIC_DEFINITION` 澄清；只在 `employee` 的角色上不同 → `JOIN_ROLE` 澄清；其他分歧 → 执行候选 1 并带 `LOW_AGREEMENT`；`understanding_samples = 1` 时只调用一次理解。
+12. （2026-11-22，实体）值索引中有"华东精密有限公司"时，"华东精密"解析为该客户的键，并带"按 … 匹配"警告；没有值索引构建时行为与原规则相同。
+13. （2026-11-22）`export-example` 导出的 YAML 能被 Spec 05 加载，`status = DRAFT`，实体过滤值为空。
 
 ## 6. 新增依赖
 
@@ -471,6 +524,8 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 - **模型供应商未定**：第 5 周的真实评测依赖 11.6 的合规结论和可用的模型端点。结论未出时，开发与 CI 全部用 `FakeLLM`，第 5 周交付会缺少真实分数。这是第 5 周的关键外部依赖。
 - **不使用 Checkpointer**：澄清与续问通过 `query_execution` 中保存的 IR 和 `Clarification` 在新一轮重新进入工作流（`initial_ir`），不需要 LangGraph 中断恢复。代价是每轮重新绑定活跃 release（Spec 09 会检查 IR 在新 release 上的兼容性）。
 - **关键词检索的上限**：不分词的子串匹配依赖同义词维护质量；召回不足时表现为 LLM 选不到正确指标，评测中可见。按架构 8.5，以召回率实测决定是否进入阶段 B。
+- **多候选的成本与收益**（2026-11-22）：k = 3 使理解阶段的模型调用与 token 约为原来的 3 倍（并发执行，延迟增加有限）。收益来自调研中的同类方法，**在本项目上尚未实测**；第 5 周用 Spec 03 的 `candidate_agreement`、`llm_calls` 与 `understanding_samples = 1` 的对照运行比较准确率和成本，收益不明显时把默认值改为 1。
+- **值索引候选进入上下文**（2026-11-22）：命中值是业务数据，虽然只来自非敏感、低基数列，仍需要 11.6 合规结论确认（开放决策 5）。不允许时关闭"值索引命中"数据区，只在 A5 内部使用值索引（不发给模型）。
 - **歧义"影响"一律视为 HIGH** 是简化；误澄清率（22.2 要求 ≤ 10%）在评测中监控，偏高时优先给术语和维度补默认值，而不是放松规则。
 - **结果不落库**：`GET /api/v1/query/{id}` 只能返回元信息与 SQL，不能重新取回数据（见 Spec 09）。
 - **开放决策（需用户确认）**：
@@ -478,3 +533,4 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
   2. 是否接受只实现 OpenAI 兼容协议这一种适配器。
   3. 是否开启 `llm_explain_results`（把统计摘要发给模型生成解释）。
   4. 查询结果是否需要在系统库中保留（影响 Spec 09 的"查看历史结果"）。
+  5. （2026-11-22）值索引命中的值能否放进模型上下文（与 Spec 02 开放决策 3 是同一个问题）；`understanding_samples` 默认 3 还是 1。

@@ -59,7 +59,7 @@ Only create directories when the module is actually being built; the MVP deliber
   - Migrations: `uv run alembic upgrade head`
   - API: `uv run uvicorn apps.api.main:app --no-access-log`; worker: `uv run python -m text2sql.jobs.worker`
   - Integration tests: `set -a && source .env && set +a && uv run pytest -m integration` (tests skip when `T2S_TEST_*` URLs are unset)
-- The business MySQL account `t2s_ro` (`T2S_BUSINESS_DB_URL`) is only for metadata collection and `/readyz`; never execute user SQL with it.
+- The business MySQL account `t2s_ro` (`T2S_BUSINESS_DB_URL`) is only for metadata collection (including the Spec 02 value index, which reads distinct values of filtered low-cardinality columns) and `/readyz`; never execute user SQL with it.
 
 ## Environment and commands
 

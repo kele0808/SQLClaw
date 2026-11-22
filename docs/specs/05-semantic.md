@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 2、3、5）。新增 S9「已验证问答样例库」（问题 → IR，YAML + PR 审核，依赖失效时自动不可用，4.9）；新增 S10「业务域」（所有对象可选 `domain`，`model.yaml` 声明域与表的对应）；`columns.yaml` 加 `value_index`，生成 Spec 02 值索引的 include/exclude；2.2 记录阶段 2 的"LLM 起草 DRAFT 语义对象"。S9、S10 与 `value_index` 属于 **MVP**（S9 的格式与校验第 3 周，样例内容第 5 周随 Spec 08 补齐）；LLM 起草属于**阶段 2**。
 - 对应架构文档：第七章（7.1～7.4 及修订）、9.6（默认口径）、11.5（敏感字段清单）、1.4（指标定义人与审核人）、5.5（Release 组成）、第二十三章（第 3 周）
 - 依赖：Spec 01、Spec 02（快照、release、`StaleSet`）、Spec 04（边 ID、`tree_from_edges`、`JoinGraph`、`semantic_dir`）
 - 被依赖：06（指标、维度、枚举、默认值）、07（字段敏感级别与脱敏规则、租户键）、08（术语与同义词、实体查找）、09（影响分析）
@@ -24,6 +26,8 @@
 | S6 | Release 组装 | `build_candidate_release()`：快照 + Join Graph 版本 + 语义版本 |
 | S7 | ReleaseBundle | 运行时按 release 加载并缓存（架构 17.6 的 Schema Cache） |
 | S8 | CLI | 校验、查看、PR 检查、构建 release |
+| S9 | 问答样例库（2026-11-22） | `examples/*.yaml`：已审核的"问题 → IR"对，供 Spec 08 检索做 few-shot；依赖的指标/维度 STALE 或废弃时自动不可用（4.9） |
+| S10 | 业务域（2026-11-22） | 所有对象可选字段 `domain`；`model.yaml` 声明域及其表（通配）；为检索阶段 B/C 的按域分区预留（架构 8.5） |
 
 ### 2.2 本期不做
 
@@ -32,6 +36,8 @@
 - Semantic Evolution 自动检测（阶段 2）；MVP 的语义变更即"改 YAML + 提 PR + 构建新 release"
 - 指标表达式中的任意 SQL 片段（只允许列 + 聚合 + 过滤，原因见 7）
 - 语义层监控指标（VERIFIED 数、DRAFT 积压、审核时长；阶段 2 的看板，MVP 用 `semantic stats` 命令打印）
+- **LLM 起草 DRAFT 语义对象**（2026-11-22 记录，阶段 2）：表数上百后人工写 YAML 是冷启动瓶颈。阶段 2 提供 `semantic draft --tables t_*`：用快照（字段、注释、M9 表族）、Join Graph 和 Spec 02 值索引让 LLM 生成 `status: DRAFT` 的指标/维度/枚举/术语 YAML 与样例，写到 `drafts/` 目录，**只能经人工修改、PR 审核后**移入正式目录；DRAFT 对象的使用规则不变（4.2 状态规则：可用但标注"口径未经业务确认"）。
+  > 参考：[dbt 2026：语义层 vs Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026)（LLM 提议最少建模、人确认）；[Pinterest](https://medium.com/pinterest-engineering/unified-context-intent-embeddings-for-scalable-text-to-sql-793635e60aac) 与 [LinkedIn SQL Bot](https://arxiv.org/abs/2507.14372) 用 LLM 生成表与字段文档；CoeusBI 的离线 View Agent（见调研 §3.3）。
 
 ## 3. 目录与文件
 
@@ -44,7 +50,8 @@ semantic_definitions/ticket_demo/
 ├── enums.yaml              # 枚举值与标签
 ├── terms.yaml              # 业务术语 → 候选对象
 ├── metrics/*.yaml          # 每个指标一个文件
-└── dimensions/*.yaml       # 每个维度一个文件
+├── dimensions/*.yaml       # 每个维度一个文件
+└── examples/*.yaml         # S9 问答样例，每个样例一个文件（2026-11-22）
 src/text2sql/semantic/
 ├── __main__.py / cli.py    # S8
 ├── models.py               # S1 pydantic 模型
@@ -65,7 +72,24 @@ tests/integration/semantic/…
 
 ### 4.1 S1 定义文件
 
-所有对象共有字段：`name`（`^[a-z][a-z0-9_]{1,63}$`，同类唯一）、`display_name`、`description`、`synonyms: list[str]`、`owner`、`reviewer`、`reviewed_at: date | null`、`status`。
+所有对象共有字段：`name`（`^[a-z][a-z0-9_]{1,63}$`，同类唯一）、`display_name`、`description`、`synonyms: list[str]`、`owner`、`reviewer`、`reviewed_at: date | null`、`status`、`domain: str | null`（2026-11-22，S10）。
+
+**业务域**（S10，`model.yaml`，2026-11-22）：
+
+```yaml
+model:
+  name: ticket_demo
+  database: t2s_business
+  description: 合成工单库
+  domains:                         # 可选；为空表示单域
+    - {name: work_order, display_name: 工单, tables: ["t_work_*", "t_sla_policy", "t_tag"]}
+    - {name: customer, display_name: 客户, tables: ["t_customer*", "t_industry", "t_satisfaction"]}
+    - {name: org, display_name: 组织, tables: ["t_employee", "t_department"]}
+```
+
+- 对象的 `domain` 为空时取锚表（指标）或 `source.table`（维度）匹配到的第一个域；声明了 `domains` 时，显式写的 `domain` 必须是其中之一（校验码 `UNKNOWN_DOMAIN`）。一张表可以匹配多个域（共享维表）。
+- MVP 只存储与展示（Spec 08 一级摘要按域分组）；**阶段 2/3** 用于检索阶段 B/C 的"先选域、再选表"（架构 8.5）。
+  > 参考：[Uber QueryGPT](https://www.uber.com/blog/query-gpt/) 的 workspaces + Intent Agent 先把问题映射到业务域；[LinkedIn SQL Bot](https://arxiv.org/abs/2507.14372) 按组织与访问历史聚类；[LinkAlign](https://arxiv.org/abs/2503.18596) 的多库分层链接。
 
 **指标**（`metrics/<name>.yaml`，顶层键沿用架构 7.1 的 `metric:`）：
 
@@ -209,7 +233,10 @@ class ColumnAnnotation(BaseModel, frozen=True):
     sensitivity: Literal["NONE", "PII", "SECRET"] = "NONE"
     masking: Literal["PHONE", "EMAIL", "FULL"] | None = None    # PII 必填；SECRET 不出结果，不需要
     role: Literal["tenant_key"] | None = None
+    value_index: bool | None = None   # 2026-11-22：Spec 02 M10 值索引；None 按 Spec 02 的默认规则
 ```
+
+- `value_index`（2026-11-22）：`true` → 进入 Spec 02 `plan_value_columns` 的 include（只放宽名称/长度/注释三条软规则）；`false` → exclude。`sensitivity` 为 `PII`/`SECRET` 或 `role: tenant_key` 的字段**总是** exclude，`value_index: true` 与之同时出现时报 `VALUE_INDEX_SENSITIVE`。`release build` 之外，管理员用 `semantic value-index-args` 打印由当前定义生成的 `--include/--exclude` 参数，或由 Spec 09 入队时带上。
 
 - 每张带 `tenant_id` 的表都必须把 `tenant_id` 标为 `role: tenant_key`（校验 `TENANT_KEY_MISSING`，按快照中名为 `tenant_id` 的列检查）。Spec 06 禁止 IR 在租户键上过滤或分组，Spec 07 禁止 SQL 引用租户键以外的租户库。
 - 敏感字段清单是架构 1.3 / 11.5 的输入。合成库按上表标注；真实库由安全/合规负责人提供（开放决策）。
@@ -233,7 +260,7 @@ default_filters:
 ```python
 @dataclass(frozen=True)
 class SemanticIssue:
-    object_type: Literal["METRIC", "DIMENSION", "ENUM", "TERM", "COLUMN", "DEFAULTS"]
+    object_type: Literal["METRIC", "DIMENSION", "ENUM", "TERM", "COLUMN", "DEFAULTS", "EXAMPLE"]   # EXAMPLE：2026-11-22
     name: str
     code: str
     message: str
@@ -268,6 +295,9 @@ def build_semantic_model(defs: SemanticDefinitions, snapshot: SchemaSnapshot,
 | `ENUM_CODE_TYPE` | 枚举 code 的类型与字段类型族一致 |
 | `TERM_REF` | 术语候选引用的对象存在；`default` 必须是候选之一 |
 | `SYNONYM_CONFLICT`（WARNING） | 同一同义词指向多个对象，且没有对应的 `terms.yaml` 条目说明 |
+| `UNKNOWN_DOMAIN`（2026-11-22） | 对象显式的 `domain` 不在 `model.yaml` 的 `domains` 中 |
+| `VALUE_INDEX_SENSITIVE`（2026-11-22） | `value_index: true` 的字段是 `PII`/`SECRET` 或租户键 |
+| `EXAMPLE_*`（2026-11-22） | 样例校验，见 4.9 |
 
 状态规则（架构 7.2 修订）：
 
@@ -298,6 +328,11 @@ class SemanticModel:
     def column(self, column_key: str) -> ColumnAnnotation: ...   # 未注解返回默认值
     def tenant_key_columns(self) -> frozenset[str]: ...
     def dependencies(self) -> Mapping[tuple[ObjectType, str], frozenset[tuple[ObjectType, str]]]: ...
+    # 2026-11-22
+    def domains(self) -> tuple[DomainDef, ...]: ...
+    def domain_of_table(self, table: str) -> tuple[str, ...]: ...             # 匹配到的域名，可能为空
+    def examples(self, stale: StaleSet | None = None) -> tuple[ExampleDef, ...]: ...   # 只返回可用样例（4.9）
+    def example_dependencies(self, example_id: str) -> frozenset[tuple[ObjectType, str]]: ...
 ```
 
 `dependencies()` 返回"语义对象 → 它依赖的表、字段、边、指标"，Spec 06 用它判断对象是否因 STALE 不可用，Spec 09 用它做影响分析。
@@ -378,7 +413,47 @@ def load_active_bundle(session: Session, datasource_id: str) -> ReleaseBundle: .
 
 `uv run python -m text2sql.semantic <子命令>`：`validate`（对当前快照与 Join Graph 校验，错误时退出码 1）、`show metric|dimension NAME`、`stats`（各状态对象数）、`check-pr --base REF`。
 
+2026-11-22 新增：`examples [--all]`（列出样例及可用性、不可用原因）、`value-index-args`（打印 4.1 `value_index` 生成的 Spec 02 参数）。
+
 `uv run python -m text2sql.release <子命令>`：`build --by NAME [--snapshot ID] [--note]`、`activate ID --by NAME --reason TEXT`（调用 Spec 02 的 `activate_release`，prod 拒绝）、`show [ID|active]`。
+
+### 4.9 S9 问答样例库（2026-11-22 新增）
+
+> 参考：架构 17.2（SQL Example Management）；[WrenAI](https://github.com/Canner/WrenAI) 的 SQL pairs / Instructions；[Vanna](https://github.com/vanna-ai/vanna) 的训练问答对；[supersonic](https://github.com/tencentmusic/supersonic) 的 exemplar 召回；[DAIL-SQL](https://arxiv.org/abs/2308.15363) 证明相似样例的选择对准确率影响很大。与它们不同，我们存 **问题 → IR**（不是问题 → SQL）：IR 经确定性规划，样例在 schema 变化后只要依赖仍有效就自动适配新 release，失效时可以精确定位到依赖对象。
+
+每个样例一个文件 `examples/<id>.yaml`：
+
+```yaml
+example:
+  id: ex_dept_avg_duration          # ^[a-z][a-z0-9_]{2,63}$，与文件名一致
+  question: 各部门处理的工单数量和平均每张工单的处理时长
+  paraphrases: [每个部门的工单量和平均处理时长]   # 可选，参与检索
+  ir:                                # QueryIR v2（Spec 06 4.2）的 JSON/YAML
+    metrics: [work_order_count, avg_process_duration]
+    dimensions: [department]
+  domain: work_order                 # 可选，规则同 S10
+  owner: <样例作者>
+  reviewer: <样例审核人>
+  reviewed_at: 2026-12-10
+  status: VERIFIED                   # DRAFT | VERIFIED | DEPRECATED
+  source_query_id: null              # 可选：由哪条 query_execution 导出
+```
+
+校验（`build_semantic_model` 中执行，不依赖 Spec 06 代码）：
+
+| 校验码 | 规则 |
+| --- | --- |
+| `EXAMPLE_ID` | `id` 唯一且与文件名一致 |
+| `EXAMPLE_REF` | `ir` 中引用的指标（`metrics` 及比率的分子分母）、维度（`dimensions`、`filters[].dimension`、`partition_by`）在模型中存在；`filters[].column` 的表与列在快照中存在 |
+| `EXAMPLE_ENTITY_VALUE` | `entity_lookup` 维度上的过滤 `values` 必须为空（实体键是租户数据，不能写进共享样例；规则与 Spec 08 4.5 对 LLM 的要求一致） |
+| `EXAMPLE_TENANT_KEY` | `ir` 不得引用租户键字段 |
+| `REVIEW_INCOMPLETE` | 同 4.2：VERIFIED 样例要有 `owner`、`reviewer`、`reviewed_at` 且二者不同 |
+
+- **依赖**：从 `ir` 语法上取出引用的指标、维度和列（比率展开分子分母），再并上这些对象自身的 `dependencies()`（表、列、边）。`example_dependencies()` 返回这个集合。
+- **可用性**（每次调用 `examples(stale)` 实时计算，不落库）：`status = VERIFIED`，且依赖中没有 `DEPRECATED` 对象、没有被 `StaleSet` 标记的对象（含"列所在表被标记"）。不可用的样例不进入检索，也不报错；`semantic examples --all` 列出不可用原因。这对应架构 17.2"依赖变化 → 标记失效 → 重新验证 → 恢复检索"，其中"标记失效"由 STALE 自动完成，"重新验证"即 owner 修改样例、重新审核、新 release 生效。
+- **规划校验**：Spec 06 落地后，`release build`（Spec 05 S6）对每个 VERIFIED 样例调用 `compile_ir`（as_of 取构建当天），`PlanFailed`/`Unsupported` 视为构建错误（`EXAMPLE_PLAN_FAILED`），保证进入 release 的样例都能编译。
+- **来源**：手写；或由 Spec 08 的 CLI `agent export-example QUERY_ID` 把一条 `completed` 的 `query_execution` 导出为 `status: DRAFT` 的样例文件（问题原文 + 规划后 IR，去掉 `assumptions` 与实体键），人工修改后提 PR 改为 VERIFIED。
+- 合成库：第 5 周随 Spec 08 提供不少于 15 个 VERIFIED 样例；样例问题**不得**与验收集题目相同或只做同义改写（避免评测泄露），`semantic validate` 对与验收题 `question` 的字符二元组 Jaccard ≥ 0.8 的样例报 WARNING `EXAMPLE_NEAR_ACCEPTANCE`。
 
 ## 5. 验收标准
 
@@ -390,6 +465,9 @@ def load_active_bundle(session: Session, datasource_id: str) -> ReleaseBundle: .
 6. `release build` 产生 `CANDIDATE` release，三个组件 ID 齐全；内容不变时再次构建复用相同的 Join Graph 版本与语义版本 ID（但产生新的 release 记录）。
 7. `load_bundle` 第二次调用命中缓存（不访问数据库，测试中计数）；只含快照的 release 抛 `RELEASE_INCOMPLETE`。
 8. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
+9. （2026-11-22，S9）4.9 表中每个 `EXAMPLE_*` 校验码至少一个失败用例；标记维度 `department` 的路径边 STALE 后，依赖它的样例不在 `examples(stale)` 中，其他样例仍在；把样例依赖的指标改为 `DEPRECATED` 后同样不可用。
+10. （2026-11-22，S10）显式 `domain` 不在 `domains` 中报 `UNKNOWN_DOMAIN`；未写 `domain` 的指标取锚表匹配的域；`domain_of_table("t_work_order") == ("work_order",)`。
+11. （2026-11-22）`value_index: true` 加在 `PII` 字段上报 `VALUE_INDEX_SENSITIVE`；`value-index-args` 输出中 PII 字段与租户键都在 `--exclude`。
 
 ## 6. 新增依赖
 

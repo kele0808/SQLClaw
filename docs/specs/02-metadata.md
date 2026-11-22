@@ -2,6 +2,8 @@
 
 - 状态：已确认（2026-11-20）
 - 日期：2026-11-20
+- 修订记录：
+  - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 3、5）。新增 M9「表族与公共列」（只派生、不存储）和 M10「值索引」（离线 distinct 值 + PG `pg_trgm` 模糊匹配，供 Spec 05/08 实体解析先查）；4.1 加值索引配置；4.9 加子命令与队列任务 `metadata.value_index`；验收追加 13–16。两项都属于 **MVP**（第 1 周随 Spec 02 实现），原因：成本低，且 Spec 03 的干扰表压测和 Spec 08 的实体解析依赖它们。
 - 对应架构文档：`docs/architecture.md` 第四章（4.1～4.3）、5.1/5.3/5.5 的 MVP 修订、2.1（信任边界）、11.6（元数据清洗）、16.2（漂移）、第十九章（版本记录）、第二十三章（第 1 周）
 - 依赖：Spec 01（Settings、`session_scope()`、`get_business_engine()`、`jobs` 队列、Alembic、`trace_id`）
 - 被依赖：03（快照用于校验验收集）、04、05、06、07、08、09
@@ -24,13 +26,16 @@
 | M6 | Release 与指针 | `metadata_release`（预留 Join Graph / 语义层 / Prompt / 模型版本列）、指针、事件日志；本期提供不带门禁的创建与激活 |
 | M7 | STALE 标记存储 | `metadata_stale_mark` 表与读写接口（由 08、09 写入，06/08 读取） |
 | M8 | 触发方式 | CLI 与队列任务 `metadata.sync`（HTTP 接口在 Spec 09） |
+| M9 | 表族与公共列（2026-11-22 新增） | 从快照派生：同名前缀 + 同列签名的分表/备份表归为一个"表族"，多数表都有的审计列记为"公共列"；只是计算，不存储（4.10） |
+| M10 | 值索引（2026-11-22 新增） | 对非敏感、非键、低基数的文本列离线取 distinct 值，按租户存入 PG，用 `pg_trgm` 做精确 + 模糊匹配；本 Spec 唯一读业务行的部分（4.11） |
 
 ### 2.2 本期不做
 
 - Migration Hook、定时 Snapshot、每日 Reconciliation（架构 5.3，阶段 2）
 - Schema Diff、变更事件、影响分析、带门禁的发布与回滚（Spec 09）
 - Join 边（Spec 04）、语义层（Spec 05）
-- Data Profiling、采样、Top Values（架构 17.1，阶段 2）
+- Data Profiling、采样、Top Values（架构 17.1，阶段 2）。例外：M10 值索引只取低基数文本列的 distinct 值，不算 Profiling（4.11）
+- 值索引的 embedding / 同义词扩展、定时重建（阶段 2；MVP 由 sync 后手动或 Spec 09 入队触发）
 - Embedding 与 `metadata_embedding`（架构 8.5，阶段 3）
 - 分区、存储过程、触发器、CHECK 约束的采集（阶段 2；MVP 的合成库不使用这些对象）
 - 一个数据源多个 database（MVP 一个数据源只采集连接串中的那一个库，见 4.1）
@@ -43,13 +48,17 @@ src/text2sql/
 ├── metadata/
 │   ├── __main__.py            # M8 CLI 入口：python -m text2sql.metadata
 │   ├── cli.py                 # M8 子命令
-│   ├── jobs.py                # M8 队列 handler：metadata.sync
+│   ├── jobs.py                # M8 队列 handler：metadata.sync、metadata.value_index
 │   ├── snapshot.py            # M3 领域模型（pydantic，frozen）
+│   ├── structure.py           # M9 表族与公共列（纯函数）
+│   ├── value_index.py         # M10 列筛选规则、值归一化、问题切词（纯函数）
 │   ├── collector/
-│   │   └── mysql.py           # M2 采集器
+│   │   ├── mysql.py           # M2 采集器
+│   │   └── values.py          # M10 distinct 值读取
 │   ├── catalog/
-│   │   ├── models.py          # M1/M3/M4/M5/M6/M7 SQLAlchemy 模型
-│   │   └── repository.py      # M3 快照写入与加载
+│   │   ├── models.py          # M1/M3/M4/M5/M6/M7/M10 SQLAlchemy 模型
+│   │   ├── repository.py      # M3 快照写入与加载
+│   │   └── value_store.py     # M10 值索引写入与检索
 │   ├── identity.py            # M4
 │   ├── comment_review.py      # M5 复核记录
 │   ├── release.py             # M6
@@ -70,10 +79,15 @@ tests/integration/metadata/…   # 对 mysql57 与 mysql80 各跑一遍
 | 字段 | 环境变量 | 类型 | 默认值 |
 | --- | --- | --- | --- |
 | `datasource_id` | `T2S_DATASOURCE_ID` | `str`（`^[a-z0-9_]{1,64}$`） | `"local"` |
+| `value_index_max_distinct` | `T2S_VALUE_INDEX_MAX_DISTINCT` | `int`（≥ 1） | `5000`：单列 distinct 值超过它就不索引（`TOO_MANY_VALUES`） |
+| `value_index_max_rows` | `T2S_VALUE_INDEX_MAX_ROWS` | `int`（≥ 1） | `2000000`：`row_estimate` 超过它的表不扫描（`TOO_MANY_ROWS`） |
+| `value_index_max_value_length` | `T2S_VALUE_INDEX_MAX_VALUE_LENGTH` | `int`（1–512） | `128`：更长的值不收 |
+| `value_index_timeout_ms` | `T2S_VALUE_INDEX_TIMEOUT_MS` | `int`（≥ 100） | `3000`：单列查询的 `MAX_EXECUTION_TIME`，须小于 Spec 01 的 `business_db_timeout_s`（客户端读超时 5 s） |
+| `value_index_tenant_column` | `T2S_VALUE_INDEX_TENANT_COLUMN` | `str` | `"tenant_id"`：租户列名；空串表示单租户库，关闭租户规则 |
 
 - 一个进程对应一个数据源。采集目标是 `Settings.business_db_url` 中的默认库（`SELECT DATABASE()`），为空时采集失败并报 `METADATA_NO_DATABASE`。
 - 本地开发约定 `.env.example` 中 `T2S_DATASOURCE_ID=local_mysql80`；测 5.7 时切换为 `local_mysql57` 并改 `T2S_BUSINESS_DB_URL`。两个数据源的元数据可以共存于同一个 PG。
-- 采集使用 Spec 01 的 `get_business_engine()`（只读会话、`t2s_ro` 账号）。采集只读 `information_schema` 和会话变量，不读业务数据。注意：网关（Spec 07）禁止用户 SQL 访问 `information_schema`，采集器不经过网关，两者不冲突。
+- 采集使用 Spec 01 的 `get_business_engine()`（只读会话、`t2s_ro` 账号）。结构采集（M2）只读 `information_schema` 和会话变量，不读业务数据；唯一的例外是 M10 值索引，它用同一个只读引擎对筛选后的列执行有界的 `SELECT DISTINCT`（4.11），仍属于"元数据采集"，不执行任何用户 SQL。注意：网关（Spec 07）禁止用户 SQL 访问 `information_schema`，采集器不经过网关，两者不冲突。
 
 ### 4.2 M2 采集器
 
@@ -400,6 +414,10 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 | 子命令 | 作用 |
 | --- | --- |
 | `sync` | 采集并保存快照，打印 `snapshot_id`、是否 `unchanged`、表数与字段数、被标记的注释数 |
+| `structure [--snapshot ID\|latest]` | 打印表族（代表表与成员）和公共列（M9） |
+| `values build [--include t.c ...] [--exclude t.c ...]` | 基于最新快照重建值索引（M10），打印索引列数、跳过列数、值数 |
+| `values show` | 打印最新一次构建的每一列：已索引或跳过原因、值数 |
+| `values search TEXT [--tenant KEY]` | 调试用：打印命中的列、值、分数、精确/模糊 |
 | `snapshots` | 列出当前数据源最近 20 个快照 |
 | `show [--snapshot ID\|latest] [--table NAME]` | 打印快照概要或某张表的字段、索引、外键、注释与标记 |
 | `flagged [--snapshot ID\|latest]` | 列出带注入标记且未复核的注释 |
@@ -411,6 +429,106 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 队列：`@register("metadata.sync")`，payload `{"datasource_id": str, "requested_by": str}`；`datasource_id` 必须等于当前进程的 `Settings.datasource_id`，否则任务失败（不重试，直接 `failed`：handler 抛出 Spec 01 F6 定义的 `NonRetryableJobError`）。
 
 日志：采集开始、结束各一条，字段含 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`、`trace_id`。
+
+值索引队列：`@register("metadata.value_index")`，payload `{"datasource_id": str, "requested_by": str, "include"?: [str], "exclude"?: [str]}`，`datasource_id` 校验同上。MVP 由人在 `sync` 后执行 `values build`；Spec 09 的 `sync_and_diff` 在结构变化后自动入队。
+
+### 4.10 M9 表族与公共列
+
+> 参考：[ReFoRCE](https://arxiv.org/abs/2502.00675) 按表名模式把同构表分组压缩；[DBCC](https://arxiv.org/abs/2606.28601) 抽取重复审计列、同构表模板化，Spider 2.0-Snow 上下文从 2.6M 降到 34.7K tokens。真实业务库里 `t_order_202401`、`t_order_bak` 这类分表/备份表和 `created_by`/`updated_at` 审计列是检索噪声的主要来源。
+
+`text2sql.metadata.structure` 中的纯函数，输入快照的表列表，输出不存储、不进 `content_hash`（规则调整不应产生新快照）：
+
+```python
+@dataclass(frozen=True)
+class TableFamily:
+    stem: str                    # t_order
+    representative: str          # 代表表：有不带后缀的同名表时用它，否则用名字排序最后一张（通常是最新分表）
+    members: tuple[str, ...]     # 按名排序，含代表表
+
+@dataclass(frozen=True)
+class StructureSummary:
+    families: tuple[TableFamily, ...]
+    common_columns: tuple[str, ...]
+    def family_of(self, table: str) -> TableFamily | None: ...
+
+def family_stem(table_name: str) -> str: ...
+def table_families(tables: Sequence[TableData]) -> tuple[TableFamily, ...]: ...
+def common_columns(tables: Sequence[TableData], *, min_tables: int = 5, ratio: float = 0.5) -> tuple[str, ...]: ...
+def summarize_structure(tables: Sequence[TableData]) -> StructureSummary: ...
+```
+
+- **表族**：只看 `BASE TABLE`。表名去掉一个或多个尾部后缀（`_数字（1–8 位）`、`_bak`、`_backup`、`_old`、`_tmp`、`_temp`、`_copy`、`_his`、`_history`、`_archive`、`_arch`，大小写不敏感）得到 `stem`；`stem` 相同**且**列签名（按 `ordinal_position` 的 `(列名小写, data_type)` 序列）完全相同的表才归为一族，至少 2 张。列不同的同名前缀表不合并，避免把"看起来像"的两张表混为一谈。
+- **公共列**：至少 `min_tables` 张、且至少 `ratio` 比例的基表都有的 `(列名, data_type)`；主键列名不算（`id` 不是审计列）。
+- 用途（消费方）：Spec 08 检索的一级摘要按表族折叠、公共列只列一次（08 §4.2）；Spec 03 干扰表压测用表族生成"分表副本"（03 E10）；Spec 05 可对表族只建一个语义模型（阶段 2）。
+- **MVP**：实现上述函数和 `structure` 子命令。**阶段 2**：表族的人工确认/排除清单、按时间后缀的路由（查哪个分表）。
+
+### 4.11 M10 值索引
+
+> 参考：[CHESS](https://arxiv.org/abs/2405.16755) 离线对文本列建 MinHash LSH 值索引，跳过 id/url/email/phone 等列；[supersonic](https://github.com/tencentmusic/supersonic) 把维度值加载成 HanLP 词典做映射；[LinkedIn SQL Bot](https://arxiv.org/abs/2507.14372) 对类别字段取 top-K 值放进上下文。我们用 PG 自带的 `pg_trgm` 代替 LSH，不新增服务和依赖。
+
+**解决的问题**：用户说"华东区""华东精密"，要落到 `t_region.name = '华东区'`、`t_customer.name = '华东精密有限公司'`。只靠 `enums.yaml`（人工维护）和网关实时 `IN` 查询（Spec 08 A5）时，不知道该查哪一列，模糊名称也查不到。
+
+**列筛选**（`value_index.plan_value_columns`，纯函数，每个文本列一条 `ColumnDecision(table, column, tenant_column, skip_reason)`）。只考虑 `char`/`varchar`/`enum`/`*text` 类型；按顺序判断，第一条命中即为跳过原因：
+
+| 跳过原因 | 规则 |
+| --- | --- |
+| `EXCLUDED` | 在 exclude 清单中（总是优先） |
+| `VIEW` | 视图 |
+| `TOO_MANY_ROWS` | 表 `row_estimate` > `value_index_max_rows` |
+| `NO_TENANT_KEY` | 开启租户规则时，表没有 `value_index_tenant_column` 列 |
+| `KEY_COLUMN` | 主键、单列唯一、外键列、租户列 |
+| `TYPE_TOO_LONG` | `*text` 类型，或声明长度 > 255（`enum` 除外） |
+| `NAME_PATTERN` | 列名以 `_id`/`_no`/`_code`/`_key`/`token`/`password`/`hash`/`url`/`email`/`phone`/`mobile`/`address`/`ip`/`card`/`bank`/`account` 等结尾 |
+| `SENSITIVE_HINT` | 注释含 手机、电话、邮箱、地址、身份证、证件、姓名、密码、银行卡 |
+
+include 清单只放宽 `TYPE_TOO_LONG` / `NAME_PATTERN` / `SENSITIVE_HINT` 三条软规则；键列、视图、行数、租户规则不可放宽。Spec 05 `columns.yaml` 的 `value_index: true|false` 和 `sensitivity` 生成 include/exclude（05 §4.2），在 Spec 05 之前用 CLI 参数传入。
+
+**采集**（`collector/values.py`，`t2s_ro` 只读引擎）：每个合格列一条查询
+
+```sql
+SELECT /*+ MAX_EXECUTION_TIME(:timeout_ms) */ DISTINCT CAST(`tenant_id` AS CHAR) AS tenant_key, `col` AS value
+FROM `t` WHERE `col` IS NOT NULL AND `col` <> '' AND CHAR_LENGTH(`col`) <= :max_length
+LIMIT :max_distinct + 1
+```
+
+- 返回超过 `max_distinct` 行 → 该列记 `TOO_MANY_VALUES`，不收值（不是低基数列）。
+- 服务端超时（MySQL 3024 / MariaDB 1969）→ 该列记 `TIMEOUT`，构建继续；其他错误使构建失败。
+- 标识符来自快照并用反引号转义，值全部绑定参数。
+
+**存储**（迁移 `0002_metadata` 内，与其他元数据表一起建；迁移开头 `CREATE EXTENSION IF NOT EXISTS pg_trgm`，回滚不删扩展）：
+
+| 表 | 列 | 约束 / 说明 |
+| --- | --- | --- |
+| `metadata_value_build` | `id` identity；`datasource_id` FK；`snapshot_id` FK；`indexed_column_count`、`skipped_column_count`、`value_count` INT；`created_at`；`created_by`；`trace_id` | 索引 `(datasource_id, id)`；一次构建一行 |
+| `metadata_value_column` | `id`；`build_id` FK `ON DELETE CASCADE`；`column_key VARCHAR(300)`（`t.c`）；`skip_reason VARCHAR(32)` 可空；`value_count` | 唯一 `(build_id, column_key)`；跳过的列也记录，便于审计 |
+| `metadata_value` | `id`；`build_id`、`column_id` FK `ON DELETE CASCADE`；`tenant_key VARCHAR(64)` 可空；`value TEXT`；`value_norm TEXT` | 索引 `(build_id, value_norm)`；GIN `value_norm gin_trgm_ops` |
+
+- 值索引表**可变**（不是快照表）：一次构建在一个事务里写完，读方看到的要么是旧构建、要么是完整的新构建；每个数据源只保留最近 2 次构建，更早的整批删除（CASCADE）。
+- `value_norm = casefold(NFKC(value))` 并压缩空白。
+
+**检索**（`catalog/value_store.py`）：
+
+```python
+@dataclass(frozen=True)
+class ValueHit:
+    column_key: str      # "t.c"
+    value: str           # 原值，交给 IR filter 使用
+    score: float         # 精确 = 1.0；模糊 = word_similarity
+    exact: bool
+
+def save_value_build(session, *, datasource_id, snapshot_id, decisions, collected, created_by) -> int: ...
+def latest_value_build(session, datasource_id) -> ValueBuildSummary | None: ...
+def search_values(session, *, datasource_id: str, text_value: str, tenant_key: str | None,
+                  limit: int = 10, min_score: float = 0.6, columns: Collection[str] | None = None) -> list[ValueHit]: ...
+```
+
+- **精确**：问题归一化后的所有 2–16 字子串里，等于某个 `value_norm` 的（"华东区上月工单" → `华东区`）。
+- **模糊**：问题按 `\w+` 切出的片段（≤ 32 字），`span <% value_norm`（`word_similarity ≥ min_score`，走 GIN 索引）（"华东精密" → `华东精密有限公司`，0.8）。
+- **租户隔离**：`tenant_key` 必填语义——传租户只返回该租户的值；传 `None` 只返回无租户列表的值。值索引是业务库之外的副本，不受数据库层租户视图保护，所以租户过滤在存储层强制，Spec 08 必须传 `principal.tenant_id`。
+- 数据源还没有构建时返回空列表（检索方回退到原有路径）；CLI 报 `VALUE_INDEX_NOT_FOUND`。
+- 命中结果是**不可信数据**（与注释同级，见 AGENTS.md 规则 6）：进入 LLM 上下文时放在数据区、只作候选，最终值仍由 Spec 08 A5 经网关确认。
+
+**MVP / 阶段 2**：MVP 做上述规则、构建、精确 + 模糊检索、CLI 和队列任务。阶段 2：同义词/拼音、embedding 召回、增量构建、按列的刷新频率、值频次排序。
 
 ## 5. 验收标准
 
@@ -426,6 +544,10 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 10. 连接 5.7.8 以下版本时（单元测试中模拟版本字符串）报 `METADATA_UNSUPPORTED_VERSION`。
 11. `uv run python -m text2sql.metadata show --table <表>` 能打印字段、索引、外键和注释标记（第 1 周交付"元数据快照可查询"）。
 12. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
+13. （M9）`t_order`、`t_order_2023`、`t_order_bak` 列相同 → 一个表族，代表表 `t_order`；多一列的同前缀表或视图不入族；没有不带后缀的表时名字最大的分表做代表；`created_at` 出现在 ≥ 5 张且过半基表时列为公共列，主键 `id` 不算（单元测试）。
+14. （M10 规则）键列、外键列、租户列、`*_code`/`*_phone` 等列名、注释含"手机"的列、视图、超行数表、无租户列的表都被跳过并给出对应原因；exclude 优先于 include；include 不能放宽键列（单元测试）。
+15. （M10 采集）夹具库 `t_customer` 插入两个租户的数据后 `values build`：`t_customer.name` 被索引且每个值带租户键；`max_distinct` 小于实际值数时该列记 `TOO_MANY_VALUES`（集成测试，5.7 / 8.0）。
+16. （M10 检索）`search_values` 对"华东精密"返回租户 1001 的 `华东精密有限公司`（模糊），对租户 1002 返回空；精确子串命中排在前面；只保留最近 2 次构建；迁移后 `pg_extension` 中有 `pg_trgm`（集成测试）。
 
 ## 6. 新增依赖
 
@@ -437,7 +559,12 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 - **采集账号权限**：`t2s_ro` 只有 `SELECT`，看不到视图定义（需 `SHOW VIEW`）。MVP 合成库不在业务库内放视图，不受影响；真实库若视图承载业务逻辑（架构 17.3），需要 DBA 授予 `SHOW VIEW`（开放决策，见下）。
 - **`TABLE_ROWS` 仅为估计值**，InnoDB 上误差可能很大，只用于展示和成本提示，不进入任何正确性判断。
 - **快照去重的副作用**：结构不变时沿用旧快照，`row_estimate` 也停在旧值。阶段 2 引入 Data Profiling 时单独存储统计信息。
+- **值索引的合规**（架构 11.6）：值索引把业务数据的一部分复制到 PG。筛选规则跳过键列、敏感名称和注释，但规则是启发式的；上线真实库前需要数据负责人过一遍 `values show` 的结果，必要时在 Spec 05 `columns.yaml` 中标 `value_index: false`。
+- **值索引的租户隔离**：只索引带租户列的表（或显式关闭租户规则的单租户库），检索时强制按租户过滤。若真实库的租户列名不统一，需要扩展为按表配置（开放决策 3）。
+- **`pg_trgm` 与中文**：trigram 对 CJK 的支持取决于数据库的 locale/ctype。已实测 PG 16（`en_US.utf8`）和 PG 17（`C.UTF-8`）对中文可用（`word_similarity('华东精密','华东精密有限公司') = 0.8`）。`pg_trgm` 从 PG 13 起是 trusted 扩展，库属主即可创建；生产库若禁止，需要 DBA 预先创建。
+- **扫描成本**：每列一条带 `MAX_EXECUTION_TIME` 的 `DISTINCT` 查询，只在副本上、离线执行；超大表靠 `value_index_max_rows` 跳过。
 - **单库假设**：一个数据源只采集一个库。真实库是多 schema 时（1.3 待填），需要在对象键中加库名，属于后续 Spec 的变更。
 - **开放决策（需用户确认）**：
   1. 真实目标库画像（架构 1.3）：版本、表/字段规模、是否有 `SHOW VIEW` 权限、`lower_case_table_names`。本 Spec 的规模上限（2000 表 / 50000 字段）是 MVP 防护值，按画像调整。
   2. 注释复核人（架构 1.4 未填）：`review-comment` 的 `--reviewer` 由谁担任。
+  3. 值索引（2026-11-22 新增）：真实库的租户列名是否统一为一个；值索引命中的值能否作为候选放进 LLM 上下文（本 Spec 默认：非敏感列可以，敏感列从不入索引）。
