@@ -4,7 +4,7 @@
 - 对照的仓库版本：kele0808/text2sql `d32bcb7`（plan 02 Task 2 已完成，值索引还没写代码）
 - 方法：直接读开源项目的源码文件、厂商文档页面和 MySQL 官方手册；在本机 Compose 的 MySQL 5.7.44 / 8.0.46 上用 10 万行的表实测 `EXPLAIN`。
 - 标注约定同 01：**[已核实]** 表示这次亲自打开过源码、文档或跑过实验；**[未核实]** 表示没有打开原文，或只看了二手资料。
-- 落地：spec 02 §4.11 的 2026-11-22 修订（大表索引路径、`BIG_TABLE_NO_INDEX`、`NO_LOOSE_SCAN`，验收 17、18），spec 05 §4.1 的 `values`，plan 02 Task 14、15。
+- 落地：spec 02 §4.11 的 2026-11-22 修订（大表索引路径、`BIG_TABLE_NO_INDEX`、`NO_LOOSE_SCAN`，验收 17、18），spec 05 §4.1 的 `values`，plan 02 Task 14、15。对应的难题笔记：[problem-01](problem-01-大表值采集与值链接.md)。
 
 ---
 
