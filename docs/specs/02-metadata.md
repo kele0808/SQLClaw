@@ -1,9 +1,10 @@
 # Spec 02：Metadata 元数据目录
 
-- 状态：已确认（2026-11-20）；按 docs/plans/02-metadata.md「待确认」修订（2026-11-22）
+- 状态：已确认（2026-11-20）；按 docs/plans/02-metadata.md「待确认」修订（2026-11-22）；大表值采集改为索引路径（2026-11-22，见 `docs/research/02-value-index-large-tables.md`）
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 3、5）。新增 M9「表族与公共列」（只派生、不存储）和 M10「值索引」（离线 distinct 值 + PG `pg_trgm` 模糊匹配，供 Spec 05/08 实体解析先查）；4.1 加值索引配置；4.9 加子命令与队列任务 `metadata.value_index`；验收追加 13–16。两项都属于 **MVP**（第 1 周随 Spec 02 实现），原因：成本低，且 Spec 03 的干扰表压测和 Spec 08 的实体解析依赖它们。
+  - 2026-11-22（大表值采集，`docs/research/02-value-index-large-tables.md`）：4.11 去掉整表跳过的 `TOO_MANY_ROWS`，改为逐列的「大表索引路径」：超过 `value_index_max_rows` 的表，只有存在 `(租户列, 本列)` 前导整列 BTREE 索引的列才采（否则 `BIG_TABLE_NO_INDEX`），执行前用 `EXPLAIN` 确认松散索引扫描（否则 `NO_LOOSE_SCAN`）；采集 SQL 的 `DISTINCT` 只放裸列（去掉 `CAST(... AS CHAR)` 和 `NULL AS tenant_key`，二者会让松散扫描失效，本机实测）；`ColumnDecision` 加 `path`；验收 14、15 改写，追加 17、18。索引信息沿用已有的 `IndexInfo.columns` / `sub_parts` / `index_type`，模型和表结构不变。
 - 对应架构文档：`docs/architecture.md` 第四章（4.1～4.3）、5.1/5.3/5.5 的 MVP 修订、2.1（信任边界）、11.6（元数据清洗）、16.2（漂移）、第十九章（版本记录）、第二十三章（第 1 周）
 - 依赖：Spec 01（Settings、`session_scope()`、`get_business_engine()`、`jobs` 队列、Alembic、`trace_id`）
 - 被依赖：03（快照用于校验验收集）、04、05、06、07、08、09
@@ -80,7 +81,7 @@ tests/integration/metadata/…   # 对 mysql57 与 mysql80 各跑一遍
 | --- | --- | --- | --- |
 | `datasource_id` | `T2S_DATASOURCE_ID` | `str`（`^[a-z0-9_]{1,64}$`） | `"local"` |
 | `value_index_max_distinct` | `T2S_VALUE_INDEX_MAX_DISTINCT` | `int`（≥ 1） | `5000`：单列 distinct 值超过它就不索引（`TOO_MANY_VALUES`） |
-| `value_index_max_rows` | `T2S_VALUE_INDEX_MAX_ROWS` | `int`（≥ 1） | `2000000`：`row_estimate` 超过它的表不扫描（`TOO_MANY_ROWS`） |
+| `value_index_max_rows` | `T2S_VALUE_INDEX_MAX_ROWS` | `int`（≥ 1） | `2000000`：`row_estimate` 超过它的表是「大表」，只采有 `(租户列, 列)` 前导索引、且 `EXPLAIN` 确认松散索引扫描的列（`BIG_TABLE_NO_INDEX` / `NO_LOOSE_SCAN`，4.11） |
 | `value_index_max_value_length` | `T2S_VALUE_INDEX_MAX_VALUE_LENGTH` | `int`（1–512） | `128`：更长的值不收 |
 | `value_index_timeout_ms` | `T2S_VALUE_INDEX_TIMEOUT_MS` | `int`（≥ 100） | `3000`：单列查询的 `MAX_EXECUTION_TIME`，须小于 Spec 01 的 `business_db_timeout_s`（客户端读超时 5 s） |
 | `value_index_tenant_column` | `T2S_VALUE_INDEX_TENANT_COLUMN` | `str` | `"tenant_id"`：租户列名；空串表示单租户库，关闭租户规则 |
@@ -477,35 +478,55 @@ def summarize_structure(tables: Sequence[TableData]) -> StructureSummary: ...
 ### 4.11 M10 值索引
 
 > 参考：[CHESS](https://arxiv.org/abs/2405.16755) 离线对文本列建 MinHash LSH 值索引，跳过 id/url/email/phone 等列；[supersonic](https://github.com/tencentmusic/supersonic) 把维度值加载成 HanLP 词典做映射；[LinkedIn SQL Bot](https://arxiv.org/abs/2507.14372) 对类别字段取 top-K 值放进上下文。我们用 PG 自带的 `pg_trgm` 代替 LSH，不新增服务和依赖。
+>
+> 大表（2026-11-22，详见 `docs/research/02-value-index-large-tables.md`）：CHESS、CodeS 面向 SQLite 小库，对整列直接 `SELECT DISTINCT`；工业界（supersonic、Databricks Genie、Snowflake Cortex Analyst）都不自动扫大表，靠用户选列、限定扫描范围或数仓算力。我们连的是 MySQL 只读库，所以只走 MySQL 的松散索引扫描（loose index scan）：成本和 distinct 值个数成正比，和行数无关。
 
 **解决的问题**：用户说"华东区""华东精密"，要落到 `t_region.name = '华东区'`、`t_customer.name = '华东精密有限公司'`。只靠 `enums.yaml`（人工维护）和网关实时 `IN` 查询（Spec 08 A5）时，不知道该查哪一列，模糊名称也查不到。
 
-**列筛选**（`value_index.plan_value_columns`，纯函数，每个文本列一条 `ColumnDecision(table, column, tenant_column, skip_reason)`）。只考虑 `char`/`varchar`/`enum`/`*text` 类型；按顺序判断，第一条命中即为跳过原因：
+**列筛选**（`value_index.plan_value_columns`，纯函数，每个文本列一条 `ColumnDecision(table, column, tenant_column, skip_reason, path)`，`path ∈ {"normal", "big_table"}`）。只考虑 `char`/`varchar`/`enum`/`*text` 类型；按下表顺序判断，第一条命中即为跳过原因：
 
 | 跳过原因 | 规则 |
 | --- | --- |
 | `EXCLUDED` | 在 exclude 清单中（总是优先） |
 | `VIEW` | 视图 |
-| `TOO_MANY_ROWS` | 表 `row_estimate` > `value_index_max_rows` |
 | `NO_TENANT_KEY` | 开启租户规则时，表没有 `value_index_tenant_column` 列 |
 | `KEY_COLUMN` | 主键、单列唯一、外键列、租户列 |
 | `TYPE_TOO_LONG` | `*text` 类型，或声明长度 > 255（`enum` 除外） |
 | `NAME_PATTERN` | 列名以 `_id`/`_no`/`_code`/`_key`/`token`/`password`/`hash`/`url`/`email`/`phone`/`mobile`/`address`/`ip`/`card`/`bank`/`account` 等结尾 |
 | `SENSITIVE_HINT` | 注释含 手机、电话、邮箱、地址、身份证、证件、姓名、密码、银行卡 |
+| `BIG_TABLE_NO_INDEX` | 大表（`row_estimate` > `value_index_max_rows`）上没有「大表索引路径」：需要一个 `index_type = BTREE` 的索引，前导列依次是 `(租户列, 本列)`（关闭租户规则时本列是第一列），且这几列都是整列索引（`IndexInfo.sub_parts` 对应位置为 `None`；前缀索引不能做松散扫描） |
 
-include 清单只放宽 `TYPE_TOO_LONG` / `NAME_PATTERN` / `SENSITIVE_HINT` 三条软规则；键列、视图、行数、租户规则不可放宽。Spec 05 `columns.yaml` 的 `value_index: true|false` 和 `sensitivity` 生成 include/exclude（05 §4.2），在 Spec 05 之前用 CLI 参数传入。
+- **`path`**：`row_estimate` 不超过 `value_index_max_rows`（或为 `NULL`）的表，列的 `path = "normal"`；超过的表 `path = "big_table"`，采集器据此先做 `EXPLAIN`。判断所需的索引信息都在快照里（4.4 `IndexInfo.columns` 有序、`sub_parts`、`index_type`），`plan_value_columns` 仍是纯函数。
+- **顺序**：原来整表跳过的 `TOO_MANY_ROWS` 排在第三；改成逐列判断后放在最后，因为它是唯一能靠「加索引」解决的原因，排最后保证报出它时其他规则都已通过。例如大表上的 `remark TEXT` 报 `TYPE_TOO_LONG`，不会误导人去建索引。
+- **include / exclude**：include 清单只放宽 `TYPE_TOO_LONG` / `NAME_PATTERN` / `SENSITIVE_HINT` 三条软规则；`VIEW`、`NO_TENANT_KEY`、`KEY_COLUMN`、`BIG_TABLE_NO_INDEX`（以及采集期的 `NO_LOOSE_SCAN`）不可放宽，被 include 放宽的列在大表上仍要有索引。Spec 05 `columns.yaml` 的 `value_index: true|false` 和 `sensitivity` 生成 include/exclude（05 §4.1），在 Spec 05 之前用 CLI 参数传入。
 
-**采集**（`collector/values.py`，`t2s_ro` 只读引擎）：每个合格列一条查询
+**采集**（`collector/values.py`，`t2s_ro` 只读引擎）：每个合格列一条查询，普通表和大表用同一条 SQL：
 
 ```sql
-SELECT /*+ MAX_EXECUTION_TIME(:timeout_ms) */ DISTINCT CAST(`tenant_id` AS CHAR) AS tenant_key, `col` AS value
+-- 开启租户规则
+SELECT /*+ MAX_EXECUTION_TIME(:timeout_ms) */ DISTINCT `tenant_id` AS tenant_key, `col` AS value
+FROM `t` WHERE `col` IS NOT NULL AND `col` <> '' AND CHAR_LENGTH(`col`) <= :max_length
+LIMIT :max_distinct + 1
+
+-- 关闭租户规则：不选租户列，tenant_key 记 NULL
+SELECT /*+ MAX_EXECUTION_TIME(:timeout_ms) */ DISTINCT `col` AS value
 FROM `t` WHERE `col` IS NOT NULL AND `col` <> '' AND CHAR_LENGTH(`col`) <= :max_length
 LIMIT :max_distinct + 1
 ```
 
+- **`DISTINCT` 只放裸列。** 租户键在 Python 里转成字符串（`str()`，`bytes` 按 UTF-8 解码），不在 SQL 里 `CAST(... AS CHAR)`；关闭租户规则时也不写 `NULL AS tenant_key`。原因：松散索引扫描要求 `DISTINCT` 的每一项都是索引最左前缀里的列（MySQL 手册 [GROUP BY Optimization](https://dev.mysql.com/doc/refman/5.7/en/group-by-optimization.html)：「all distinct attributes refer to columns that form a leftmost prefix of the index」），`CAST` 和常量都会让它退化成全索引扫描（2026-11-22 本机 5.7.44 / 8.0.46、10 万行表实测，见 research 02）。
+- **大表先 `EXPLAIN`。** `path = "big_table"` 的列先在同一个 `t2s_ro` 连接上执行 `EXPLAIN FORMAT=TRADITIONAL <同一条 SQL>`（同样的绑定参数）。任一行的 `Extra` 含 `Using index for group-by` 才执行查询；否则这一列记 `NO_LOOSE_SCAN`，不执行。`EXPLAIN` 不读数据行；写 `FORMAT=TRADITIONAL` 是为了不受 8.0.32+ 的 `explain_format` 变量影响，5.7 也支持这个写法。
+- **小表不做 `EXPLAIN`。** 小表即使有合适的索引，优化器也常选全索引扫描（成本更低），普通表照旧直接执行。
+- **`WHERE` 过滤与松散扫描。** 本机实测 `IS NOT NULL` / `<> ''` / `CHAR_LENGTH(...) <= n` 不影响松散扫描（`Extra` 为 `Using where; Using index for group-by`），所以大表也用同一条 SQL。**[待 Task 15 在 5.7 / 8.0 夹具上再次 EXPLAIN 确认]** 如果某个版本上它让松散扫描失效，`EXPLAIN` 门槛会把列记为 `NO_LOOSE_SCAN`，不会退化成全表扫描；届时再把大表 SQL 改为不带 `WHERE`、在 Python 里过滤空值和超长值。
 - 返回超过 `max_distinct` 行 → 该列记 `TOO_MANY_VALUES`，不收值（不是低基数列）。
 - 服务端超时（MySQL 3024 / MariaDB 1969）→ 该列记 `TIMEOUT`，构建继续；其他错误使构建失败。
 - 标识符来自快照并用反引号转义，值全部绑定参数。
+- **`row_estimate` 只是成本分流，不是安全边界。** 它来自快照：结构不变时沿用旧快照的值（第 7 章），8.0 还有 `information_schema_stats_expiry` 缓存，所以可能过时。表在两次快照之间涨过阈值时，这张表这次仍按普通表执行，单条查询由 `MAX_EXECUTION_TIME` 截断并记 `TIMEOUT`，不会无限扫描；下次结构变化产生新快照后按大表处理。
+
+**不采纳**（理由见 research 02）：
+- **抽样**：5.7 没有 `TABLESAMPLE`；`ORDER BY RAND()` 本身要全表扫描；`LIMIT N` 偏向聚簇索引靠前的旧数据，会漏掉新出现的值。
+- **依赖 8.0 直方图**（`information_schema.COLUMN_STATISTICS`）：建直方图要 `ANALYZE TABLE ... UPDATE HISTOGRAM`，需要 `SELECT` 以外的权限，`t2s_ro` 做不了，只能读 DBA 已建的；5.7 没有直方图。阶段 2 可作为只读补充。
+- 大表上没有合适索引的枚举列，MVP 记 `BIG_TABLE_NO_INDEX`；Spec 05 落地后，可在 `columns.yaml` 用 `values` 直接声明取值（05 §4.1），不扫业务库。
 
 **存储**（迁移 `0002_metadata` 内，与其他元数据表一起建；迁移开头 `CREATE EXTENSION IF NOT EXISTS pg_trgm`，回滚不删扩展）：
 
@@ -540,6 +561,8 @@ def search_values(session, *, datasource_id: str, text_value: str, tenant_key: s
 - 数据源还没有构建时返回空列表（检索方回退到原有路径）；CLI 报 `VALUE_INDEX_NOT_FOUND`。
 - 命中结果是**不可信数据**（与注释同级，见 AGENTS.md 规则 6）：进入 LLM 上下文时放在数据区、只作候选，最终值仍由 Spec 08 A5 经网关确认。
 
+**Spec 05 声明值**（05 §4.1 `values`）：声明的取值不查业务库，作为「声明列」进入构建，存为 `tenant_key = NULL`、对所有租户可见（只允许写跨租户通用的枚举值）。这要求 `save_value_build` 接收声明值、`search_values` 在租户过滤之外返回声明值，在 Spec 05 实现时修改本节，本 Spec MVP 不实现。
+
 **MVP / 阶段 2**：MVP 做上述规则、构建、精确 + 模糊检索、CLI 和队列任务。阶段 2：同义词/拼音、embedding 召回、增量构建、按列的刷新频率、值频次排序。
 
 ### 4.12 错误码
@@ -557,7 +580,7 @@ def search_values(session, *, datasource_id: str, text_value: str, tenant_key: s
 | `STALE_MARK_NOT_FOUND` | 404 | 解决一个不存在或已解决的 STALE 标记 |
 | `VALUE_INDEX_NOT_FOUND` | 404 | 数据源还没有值索引构建（CLI `values show` / `values search`） |
 
-4.11 里 `run_value_index` 在数据源没有快照时抛 `METADATA_SNAPSHOT_NOT_FOUND`（不另设错误码）；值采集超时不是错误，记为该列的 `TIMEOUT` 跳过原因。
+4.11 里 `run_value_index` 在数据源没有快照时抛 `METADATA_SNAPSHOT_NOT_FOUND`（不另设错误码）；值采集超时不是错误，记为该列的 `TIMEOUT` 跳过原因；大表没有松散索引扫描同样不是错误，记为 `NO_LOOSE_SCAN`。
 
 ## 5. 验收标准
 
@@ -574,9 +597,11 @@ def search_values(session, *, datasource_id: str, text_value: str, tenant_key: s
 11. `uv run python -m text2sql.metadata show --table <表>` 能打印字段、索引、外键和注释标记（第 1 周交付"元数据快照可查询"）。
 12. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
 13. （M9）`t_order`、`t_order_2023`、`t_order_bak` 列相同 → 一个表族，代表表 `t_order`；多一列的同前缀表或视图不入族；没有不带后缀的表时名字最大的分表做代表；`created_at` 出现在 ≥ 5 张且过半基表时列为公共列，主键 `id` 不算（单元测试）。
-14. （M10 规则）键列、外键列、租户列、`*_code`/`*_phone` 等列名、注释含"手机"的列、视图、超行数表、无租户列的表都被跳过并给出对应原因；exclude 优先于 include；include 不能放宽键列（单元测试）。
-15. （M10 采集）夹具库 `t_customer` 插入两个租户的数据后 `values build`：`t_customer.name` 被索引且每个值带租户键；`max_distinct` 小于实际值数时该列记 `TOO_MANY_VALUES`（集成测试，5.7 / 8.0）。
+14. （M10 规则）键列、外键列、租户列、`*_code`/`*_phone` 等列名、注释含"手机"的列、视图、无租户列的表都被跳过并给出对应原因；exclude 优先于 include；include 不能放宽键列（单元测试）。
+15. （M10 采集）夹具库 `t_customer` 插入两个租户的数据后 `values build`：`t_customer.name` 被索引且每个值带租户键（租户键由 Python 转成字符串）；`max_distinct` 小于实际值数时该列记 `TOO_MANY_VALUES`（集成测试，5.7 / 8.0）。
 16. （M10 检索）`search_values` 对"华东精密"返回租户 1001 的 `华东精密有限公司`（模糊），对租户 1002 返回空；精确子串命中排在前面；只保留最近 2 次构建；迁移后 `pg_extension` 中有 `pg_trgm`（集成测试）。
+17. （M10 大表规则，2026-11-22）`row_estimate` 超过 `max_rows` 的表：有 `(tenant_id, status)` 整列 BTREE 索引的 `status` 通过且 `path = "big_table"`；没有索引、索引里本列不在租户列之后、或是前缀索引的列记 `BIG_TABLE_NO_INDEX`；关闭租户规则时 `(status)` 单列索引即可；include 不能放宽 `BIG_TABLE_NO_INDEX`；小表的列 `path = "normal"`（单元测试）。
+18. （M10 大表采集，2026-11-22）`path = "big_table"` 的列：伪造的 `EXPLAIN` 结果不含 `Using index for group-by` 时记 `NO_LOOSE_SCAN` 且不执行取值查询，含时才执行（单元测试）；夹具库建 10 万行、带 `(tenant_id, status)` 索引的表并 `ANALYZE TABLE` 后，`status` 走索引路径被收集、按租户分开，同表无索引的列记 `BIG_TABLE_NO_INDEX`（集成测试，5.7 / 8.0）。
 
 ## 6. 新增依赖
 
@@ -591,7 +616,7 @@ def search_values(session, *, datasource_id: str, text_value: str, tenant_key: s
 - **值索引的合规**（架构 11.6）：值索引把业务数据的一部分复制到 PG。筛选规则跳过键列、敏感名称和注释，但规则是启发式的；上线真实库前需要数据负责人过一遍 `values show` 的结果，必要时在 Spec 05 `columns.yaml` 中标 `value_index: false`。
 - **值索引的租户隔离**：只索引带租户列的表（或显式关闭租户规则的单租户库），检索时强制按租户过滤。若真实库的租户列名不统一，需要扩展为按表配置（开放决策 3）。
 - **`pg_trgm` 与中文**：trigram 对 CJK 的支持取决于数据库的 locale/ctype。已实测 PG 16（`en_US.utf8`）和 PG 17（`C.UTF-8`）对中文可用（`word_similarity('华东精密','华东精密有限公司') = 0.8`）。`pg_trgm` 从 PG 13 起是 trusted 扩展，库属主即可创建；生产库若禁止，需要 DBA 预先创建。
-- **扫描成本**：每列一条带 `MAX_EXECUTION_TIME` 的 `DISTINCT` 查询，只在副本上、离线执行；超大表靠 `value_index_max_rows` 跳过。
+- **扫描成本**：每列一条带 `MAX_EXECUTION_TIME` 和 `LIMIT` 的 `DISTINCT` 查询，只在副本上、离线执行。超过 `value_index_max_rows` 的大表只走索引路径（整列 BTREE 索引最左前缀 + `EXPLAIN` 确认松散索引扫描），成本与 distinct 值个数成正比、与行数无关；没有合适索引的大表列不采（4.11）。
 - **单库假设**：一个数据源只采集一个库。真实库是多 schema 时（1.3 待填），需要在对象键中加库名，属于后续 Spec 的变更。
 - **开放决策（需用户确认）**：
   1. 真实目标库画像（架构 1.3）：版本、表/字段规模、是否有 `SHOW VIEW` 权限、`lower_case_table_names`。本 Spec 的规模上限（2000 表 / 50000 字段）是 MVP 防护值，按画像调整。

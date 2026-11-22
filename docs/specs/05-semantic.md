@@ -4,6 +4,7 @@
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 2、3、5）。新增 S9「已验证问答样例库」（问题 → IR，YAML + PR 审核，依赖失效时自动不可用，4.9）；新增 S10「业务域」（所有对象可选 `domain`，`model.yaml` 声明域与表的对应）；`columns.yaml` 加 `value_index`，生成 Spec 02 值索引的 include/exclude；2.2 记录阶段 2 的"LLM 起草 DRAFT 语义对象"。S9、S10 与 `value_index` 属于 **MVP**（S9 的格式与校验第 3 周，样例内容第 5 周随 Spec 08 补齐）；LLM 起草属于**阶段 2**。
+  - 2026-11-22（大表值采集，`docs/research/02-value-index-large-tables.md`）：`columns.yaml` 加 `values`，由人直接声明文本列的取值（借鉴 Snowflake Cortex Analyst 语义模型的 `sample_values`），进入 Spec 02 值索引而不扫业务库，用来补「大表上没有合适索引、被 Spec 02 记 `BIG_TABLE_NO_INDEX`」的枚举列；新增校验码 `DECLARED_VALUES_INVALID`，验收追加 12。随 Spec 05 实现，Spec 02 MVP 不依赖它。
 - 对应架构文档：第七章（7.1～7.4 及修订）、9.6（默认口径）、11.5（敏感字段清单）、1.4（指标定义人与审核人）、5.5（Release 组成）、第二十三章（第 3 周）
 - 依赖：Spec 01、Spec 02（快照、release、`StaleSet`）、Spec 04（边 ID、`tree_from_edges`、`JoinGraph`、`semantic_dir`）
 - 被依赖：06（指标、维度、枚举、默认值）、07（字段敏感级别与脱敏规则、租户键）、08（术语与同义词、实体查找）、09（影响分析）
@@ -222,6 +223,7 @@ columns:
   t_customer.contact_phone: {sensitivity: PII, masking: PHONE}
   t_work_order.legacy_status: {deprecated: true, note: 历史字段，以 status 为准}
   t_customer.industry_name_old: {deprecated: true, note: 已由 industry_id 取代}
+  t_order.pay_channel: {values: [WECHAT, ALIPAY, BANK_TRANSFER]}   # 大表、无 (tenant_id, pay_channel) 索引
 ```
 
 ```python
@@ -234,9 +236,15 @@ class ColumnAnnotation(BaseModel, frozen=True):
     masking: Literal["PHONE", "EMAIL", "FULL"] | None = None    # PII 必填；SECRET 不出结果，不需要
     role: Literal["tenant_key"] | None = None
     value_index: bool | None = None   # 2026-11-22：Spec 02 M10 值索引；None 按 Spec 02 的默认规则
+    values: tuple[str, ...] = ()      # 2026-11-22：声明的取值，进入值索引，不扫业务库
 ```
 
 - `value_index`（2026-11-22）：`true` → 进入 Spec 02 `plan_value_columns` 的 include（只放宽名称/长度/注释三条软规则）；`false` → exclude。`sensitivity` 为 `PII`/`SECRET` 或 `role: tenant_key` 的字段**总是** exclude，`value_index: true` 与之同时出现时报 `VALUE_INDEX_SENSITIVE`。`release build` 之外，管理员用 `semantic value-index-args` 打印由当前定义生成的 `--include/--exclude` 参数，或由 Spec 09 入队时带上。
+- `values`（2026-11-22）：人工声明的文本列取值，存的是库里的原值（与 `enums.yaml` 的 `code → label` 不同：`enums.yaml` 管编码列的标签和同义词，`values` 只给值索引提供候选）。用途是大表上没有 `(租户列, 列)` 索引、被 Spec 02 记 `BIG_TABLE_NO_INDEX` 的枚举列，例如订单表的支付渠道。规则：
+  - 声明值作为 Spec 02 值索引的「声明列」写入构建，不查业务库；存为 `tenant_key = NULL`，对所有租户可见，所以**只能写跨租户通用的枚举值**，不能写客户名这类租户数据（Spec 02 4.11「Spec 05 声明值」）。
+  - 声明值不保证库里真的有：值只是候选，最终仍由 Spec 08 A5 经网关 `IN (...)` 确认。
+  - 该列同时有 Spec 02 采到的值时，两者合并去重。
+  - 校验 `DECLARED_VALUES_INVALID`：列不是 `char`/`varchar`/`enum`；与 `value_index: false` 同时出现；该列已在 `enums.yaml` 中；值为空串、重复、超过 Spec 02 的 `value_index_max_value_length`，或个数超过 `value_index_max_distinct`。PII/SECRET 或租户键字段写 `values` 报 `VALUE_INDEX_SENSITIVE`。
 
 - 每张带 `tenant_id` 的表都必须把 `tenant_id` 标为 `role: tenant_key`（校验 `TENANT_KEY_MISSING`，按快照中名为 `tenant_id` 的列检查）。Spec 06 禁止 IR 在租户键上过滤或分组，Spec 07 禁止 SQL 引用租户键以外的租户库。
 - 敏感字段清单是架构 1.3 / 11.5 的输入。合成库按上表标注；真实库由安全/合规负责人提供（开放决策）。
@@ -296,7 +304,8 @@ def build_semantic_model(defs: SemanticDefinitions, snapshot: SchemaSnapshot,
 | `TERM_REF` | 术语候选引用的对象存在；`default` 必须是候选之一 |
 | `SYNONYM_CONFLICT`（WARNING） | 同一同义词指向多个对象，且没有对应的 `terms.yaml` 条目说明 |
 | `UNKNOWN_DOMAIN`（2026-11-22） | 对象显式的 `domain` 不在 `model.yaml` 的 `domains` 中 |
-| `VALUE_INDEX_SENSITIVE`（2026-11-22） | `value_index: true` 的字段是 `PII`/`SECRET` 或租户键 |
+| `VALUE_INDEX_SENSITIVE`（2026-11-22） | `value_index: true` 或非空 `values` 的字段是 `PII`/`SECRET` 或租户键 |
+| `DECLARED_VALUES_INVALID`（2026-11-22） | `values` 不合法，见 4.1 |
 | `EXAMPLE_*`（2026-11-22） | 样例校验，见 4.9 |
 
 状态规则（架构 7.2 修订）：
@@ -468,6 +477,7 @@ example:
 9. （2026-11-22，S9）4.9 表中每个 `EXAMPLE_*` 校验码至少一个失败用例；标记维度 `department` 的路径边 STALE 后，依赖它的样例不在 `examples(stale)` 中，其他样例仍在；把样例依赖的指标改为 `DEPRECATED` 后同样不可用。
 10. （2026-11-22，S10）显式 `domain` 不在 `domains` 中报 `UNKNOWN_DOMAIN`；未写 `domain` 的指标取锚表匹配的域；`domain_of_table("t_work_order") == ("work_order",)`。
 11. （2026-11-22）`value_index: true` 加在 `PII` 字段上报 `VALUE_INDEX_SENSITIVE`；`value-index-args` 输出中 PII 字段与租户键都在 `--exclude`。
+12. （2026-11-22）`t_order.pay_channel: {values: [WECHAT, ALIPAY]}` 进入值索引构建后，任一租户 `search_values("上月 ALIPAY 订单数")` 都能精确命中 `ALIPAY`，构建过程不对 `t_order` 发查询；`values` 写在 `int` 列、`enums.yaml` 已有的列、与 `value_index: false` 同时出现时报 `DECLARED_VALUES_INVALID`（单元测试）。
 
 ## 6. 新增依赖
 

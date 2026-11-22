@@ -4,6 +4,8 @@
 
 > **修订（2026-11-22）：** spec 02 采纳大 Schema 调研（`docs/research/01-text2sql-sota.md`）后新增 M9 表族与公共列、M10 值索引。本计划随之修改 Task 1（错误码改为 4.12，加 `VALUE_INDEX_NOT_FOUND`）、Task 2（`value_index_*` 配置）、Task 7（3 张值索引表与 `pg_trgm` 进 0002），新增 Task 13–16，原 Task 13–15 顺延为 17–19 并扩展到值索引任务、CLI 和验收 13–16。待确认 1–8 不变。
 
+> **修订（2026-11-22，大表值采集）：** spec 02 4.11 把整表跳过的 `TOO_MANY_ROWS` 改成逐列的「大表索引路径」（`BIG_TABLE_NO_INDEX`、采集期 `EXPLAIN` 门槛 `NO_LOOSE_SCAN`，`DISTINCT` 只放裸列），验收追加 17、18（调研：`docs/research/02-value-index-large-tables.md`）。本计划随之修改 Task 14（`ColumnDecision.path`、`has_loose_scan_index`、新规则顺序）、Task 15（SQL 去掉 `CAST`/`NULL AS tenant_key`、大表先 `EXPLAIN FORMAT=TRADITIONAL`、10 万行大表集成测试、在本机 5.7 / 8.0 上记录 EXPLAIN 结果）、Task 19（验收 1–18）。Task 4/5/7 不变：`IndexInfo` 已有有序 `columns`、`sub_parts`、`index_type`，采集 SQL 已取 `STATISTICS.SUB_PART`，ORM 已有 `sub_parts INT[]`。
+
 **Goal:** 按 `docs/specs/02-metadata.md`（状态：已确认）实现元数据目录：把业务 MySQL（5.7 / 8.0）的结构采集成不可变快照存入 PostgreSQL，按内容哈希去重，给表和字段分配跨版本稳定的 `object_uuid`，对注释做注入检测并支持人工复核，提供 release 与发布指针、STALE 标记存储，以及 CLI 和队列任务 `metadata.sync`；并按 2026-11-22 修订（采纳大 Schema 调研）加入表族与公共列（M9）和按租户隔离的值索引（M10，PostgreSQL `pg_trgm` 精确 + 模糊匹配，队列任务 `metadata.value_index`）。第 1 周交付「元数据快照可查询」和值索引。
 
 **Architecture:** 新代码在 `src/text2sql/metadata/`（领域模型 `snapshot.py`、采集器 `collector/mysql.py`、ORM 与仓库 `catalog/`、`identity.py`、`comment_review.py`、`release.py`、`stale.py`、表族 `structure.py`、值索引规则 `value_index.py`、值采集 `collector/values.py`、值存储与检索 `catalog/value_store.py`、`jobs.py`、`cli.py`）和 `src/text2sql/security/prompt_guard.py`。结构采集器只用 Spec 01 的只读 `get_business_engine()` 读 `information_schema`；值采集器是唯一读业务行的代码，同样只用 `t2s_ro`，每列一条带 `MAX_EXECUTION_TIME` 和 `LIMIT` 的 `DISTINCT` 查询；写 PG 的函数都接收调用方的 `Session`，事务由调用方（`session_scope()`、worker、CLI）掌握，与 Spec 01 队列的约定一致。不可变性由「应用层只有插入函数」加 PG 触发器双重保证。单元测试不连库；集成测试复用 Spec 01 的 `integration` 标记与 fixture，对 `mysql57`、`mysql80` 各跑一遍。
@@ -99,7 +101,7 @@
 | `src/text2sql/metadata/stale.py` | STALE 标记、`StaleSet` | 12 |
 | `src/text2sql/metadata/structure.py` | 表族与公共列（纯函数） | 13 |
 | `src/text2sql/metadata/value_index.py` | 值索引选列规则、归一化、问题切词 | 14 |
-| `src/text2sql/metadata/collector/values.py` | 有界的 distinct 值采集 | 15 |
+| `src/text2sql/metadata/collector/values.py` | 有界的 distinct 值采集（大表先 `EXPLAIN` 确认松散索引扫描） | 15 |
 | `src/text2sql/metadata/catalog/value_store.py` | 值索引构建的保存、保留 2 次、按租户精确 + 模糊检索 | 16 |
 | `src/text2sql/metadata/jobs.py`, `src/text2sql/jobs/worker.py` | `run_sync`、`run_value_index`、两个队列任务；worker 加载 handler 模块 | 17 |
 | `src/text2sql/metadata/__main__.py`, `src/text2sql/metadata/cli.py` | CLI（含 `structure`、`values`） | 18 |
@@ -5123,22 +5125,26 @@ git push origin main
 
 ---
 
-### Task 14: 值索引规则 `value_index.py`：选列、归一化、问题切词（M10、spec 4.11，验收 14）
+### Task 14: 值索引规则 `value_index.py`：选列、归一化、问题切词（M10、spec 4.11，验收 14、17）
 
 **Files:**
 - Create: `src/text2sql/metadata/value_index.py`
 - Test: `tests/unit/metadata/test_value_index.py`
 
 **Interfaces:**
-- Consumes: Task 4 的 `ColumnData`、`TableData`；`tests/metadata_factories.py`。
+- Consumes: Task 4 的 `ColumnData`、`TableData`、`IndexInfo`（`columns` 有序、`sub_parts`、`index_type`）；`tests/metadata_factories.py`。
 - Produces（`text2sql.metadata.value_index`，纯函数）:
-  - `SkipReason = Literal["VIEW", "TOO_MANY_ROWS", "NO_TENANT_KEY", "TYPE_TOO_LONG", "KEY_COLUMN", "NAME_PATTERN", "SENSITIVE_HINT", "EXCLUDED", "TOO_MANY_VALUES", "TIMEOUT"]`（与 spec 4.11 跳过原因表一致；后两个由 Task 15 的采集器给出）。
-  - `ColumnDecision(table, column, tenant_column, skip_reason)`，属性 `key`（`"表.列"`）、`eligible`。
-  - `plan_value_columns(tables, *, tenant_column: str | None, max_rows: int, include=(), exclude=()) -> list[ColumnDecision]`：每个文本列（`char`/`varchar`/`enum`/`*text`）一条决定。优先级：`EXCLUDED` > 表级（`VIEW`、`TOO_MANY_ROWS`、`NO_TENANT_KEY`）> `KEY_COLUMN`（主键、唯一、外键、租户列）> `include` 可解除的软规则（`TYPE_TOO_LONG`、`NAME_PATTERN`、`SENSITIVE_HINT`）。
+  - `SkipReason = Literal["VIEW", "NO_TENANT_KEY", "TYPE_TOO_LONG", "KEY_COLUMN", "NAME_PATTERN", "SENSITIVE_HINT", "BIG_TABLE_NO_INDEX", "EXCLUDED", "TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"]`（与 spec 4.11 跳过原因一致；最后三个由 Task 15 的采集器给出）。
+  - `ScanPath = Literal["normal", "big_table"]`。
+  - `ColumnDecision(table, column, tenant_column, skip_reason, path="normal")`，属性 `key`（`"表.列"`）、`eligible`。`path="big_table"` 告诉 Task 15 先做 `EXPLAIN`。
+  - `has_loose_scan_index(table, column, tenant_column) -> bool`：存在 `BTREE` 索引，前导列依次是 `(tenant_column, column)`（`tenant_column=None` 时 `column` 是第一列），且这些前导列都是整列（`sub_parts` 对应位置为 `None`）。列名比较不区分大小写。
+  - `plan_value_columns(tables, *, tenant_column: str | None, max_rows: int, include=(), exclude=()) -> list[ColumnDecision]`：每个文本列（`char`/`varchar`/`enum`/`*text`）一条决定。顺序（第一条命中即为原因）：`EXCLUDED` > 表级（`VIEW`、`NO_TENANT_KEY`）> `KEY_COLUMN`（主键、唯一、外键、租户列）> `include` 可解除的软规则（`TYPE_TOO_LONG`、`NAME_PATTERN`、`SENSITIVE_HINT`）> 大表规则 `BIG_TABLE_NO_INDEX`（`row_estimate > max_rows` 且 `has_loose_scan_index` 为假；include 不能解除）。
   - `normalize_value(value) -> str`：NFKC + casefold + 折叠空白。
   - `QueryTerms(grams, spans)`；`query_terms(text, *, min_len=2, max_len=16, max_grams=2000)`：每个词串的全部 2–16 字子串（长的在前）作精确匹配候选，整段词串作模糊匹配候选。
 
 选列规则参考 CHESS 的预处理（跳过 id、url、email、电话、地址类列，只留短文本列）和 supersonic 的维度值词典（只收低基数维度列）；另加两条自己的规则：注释像敏感信息的列跳过（`SENSITIVE_HINT`，中文提示词），多租户库里没有租户列的表整表跳过（`NO_TENANT_KEY`）——值索引是业务数据在 PG 里的副本，不受业务库的租户隔离保护，宁可漏收也不能串租户（spec 4.11、架构 11.1）。
+
+大表规则（2026-11-22 修订）参考 MySQL 的松散索引扫描：`SELECT DISTINCT a, b` 只有在 `(a, b)` 是某个 BTREE 索引的最左前缀、且不是前缀索引时，才能按「每个不同值读一次索引」执行，成本和行数无关（MySQL 手册 GROUP BY Optimization）。所以超过 `max_rows` 的表不再整表跳过，而是逐列看索引：`(tenant_id, status)` 有索引的 `status` 照样采，没有的记 `BIG_TABLE_NO_INDEX`。它排在软规则之后，因为它是唯一能靠「加索引」解决的原因：大表上的 `remark TEXT` 应该报 `TYPE_TOO_LONG`，而不是让人去建索引。规则只看快照里的 `IndexInfo`，函数仍然是纯的；优化器是否真的选松散扫描由 Task 15 的 `EXPLAIN` 门槛确认。
 
 `query_terms` 不用中文分词器：问题里逐字出现的值（「华东区」「微信」）一定是某个子串，精确匹配用 `value_norm IN (…)` 一次查完；变体（「华东精密」对「华东精密有限公司」）交给 Task 16 的 `pg_trgm` 模糊匹配。`max_grams` 防止超长问题生成过多候选。
 
@@ -5148,7 +5154,7 @@ Create `tests/unit/metadata/test_value_index.py`:
 
 ```python
 from tests.metadata_factories import make_column, make_table
-from text2sql.metadata.snapshot import ColumnData, ForeignKeyInfo, TableData
+from text2sql.metadata.snapshot import ColumnData, ForeignKeyInfo, IndexInfo, TableData
 from text2sql.metadata.value_index import normalize_value, plan_value_columns, query_terms
 
 
@@ -5215,6 +5221,7 @@ def test_decisions_carry_the_tenant_column() -> None:
     (first, *_) = plan_value_columns((_customer(),), tenant_column="TENANT_ID", max_rows=10**6)
     assert first.tenant_column == "tenant_id"
     assert first.eligible
+    assert first.path == "normal"
 
 
 def test_table_level_reasons() -> None:
@@ -5225,7 +5232,60 @@ def test_table_level_reasons() -> None:
         "v_customer.region": "VIEW",
     }
     assert _reasons((no_tenant,), tenant_column=None) == {"t_tag.tag": None}
-    assert set(_reasons((_customer(row_estimate=5_000_000),)).values()) == {"TOO_MANY_ROWS"}
+
+
+def _index(
+    name: str,
+    *columns: str,
+    sub_parts: tuple[int | None, ...] = (),
+    index_type: str = "BTREE",
+) -> IndexInfo:
+    return IndexInfo(
+        name=name,
+        is_primary=False,
+        is_unique=False,
+        columns=columns,
+        sub_parts=sub_parts or (None,) * len(columns),
+        index_type=index_type,
+    )
+
+
+def _big_customer() -> TableData:
+    return _customer(
+        row_estimate=5_000_000,
+        indexes=(
+            _index("ix_tenant_region", "tenant_id", "region"),
+            _index("ix_tenant_name", "tenant_id", "customer_name", sub_parts=(None, 8)),
+            _index("ix_level", "level"),
+            _index("ft_profile", "profile", index_type="FULLTEXT"),
+        ),
+    )
+
+
+def test_big_tables_need_a_full_leading_index() -> None:
+    decisions = {
+        d.key: d
+        for d in plan_value_columns((_big_customer(),), tenant_column="tenant_id", max_rows=10**6)
+    }
+    assert decisions["t_customer.region"].skip_reason is None
+    assert decisions["t_customer.region"].path == "big_table"
+    # Prefix index: MySQL cannot loose-scan `customer_name(8)`.
+    assert decisions["t_customer.customer_name"].skip_reason == "BIG_TABLE_NO_INDEX"
+    # `level` leads its own index, but the tenant column has to come first.
+    assert decisions["t_customer.level"].skip_reason == "BIG_TABLE_NO_INDEX"
+    # Other rules are reported first; only an index can fix BIG_TABLE_NO_INDEX.
+    assert decisions["t_customer.customer_code"].skip_reason == "NAME_PATTERN"
+    assert decisions["t_customer.remark"].skip_reason == "TYPE_TOO_LONG"
+    assert decisions["t_customer.parent_ref"].skip_reason == "KEY_COLUMN"
+
+
+def test_big_table_rule_without_tenant_and_with_include() -> None:
+    single = _reasons((_big_customer(),), tenant_column=None)
+    assert single["t_customer.level"] is None
+    assert single["t_customer.region"] == "BIG_TABLE_NO_INDEX"  # second column of its index
+    lifted = _reasons((_big_customer(),), include={"t_customer.remark", "t_customer.profile"})
+    assert lifted["t_customer.remark"] == "BIG_TABLE_NO_INDEX"
+    assert lifted["t_customer.profile"] == "BIG_TABLE_NO_INDEX"  # FULLTEXT is not BTREE
 
 
 def test_include_lifts_soft_rules_and_exclude_always_wins() -> None:
@@ -5274,6 +5334,11 @@ Pure functions only. The collector (`collector/values.py`) reads the values,
 CHESS preprocessing idea (skip ids, urls, emails, phones, addresses; keep
 short text columns) plus two rules of our own: sensitive-looking comments are
 skipped, and in multi-tenant databases every value keeps its tenant key.
+
+Tables over `max_rows` are not skipped whole: a column there is read only
+when a BTREE index starts with (tenant column, column), so MySQL can answer
+the DISTINCT with a loose index scan whose cost depends on the number of
+distinct values, not rows. The collector confirms that plan with EXPLAIN.
 """
 
 import re
@@ -5286,16 +5351,18 @@ from text2sql.metadata.snapshot import ColumnData, TableData
 
 SkipReason = Literal[
     "VIEW",
-    "TOO_MANY_ROWS",
     "NO_TENANT_KEY",
     "TYPE_TOO_LONG",
     "KEY_COLUMN",
     "NAME_PATTERN",
     "SENSITIVE_HINT",
+    "BIG_TABLE_NO_INDEX",
     "EXCLUDED",
     "TOO_MANY_VALUES",
     "TIMEOUT",
+    "NO_LOOSE_SCAN",
 ]
+ScanPath = Literal["normal", "big_table"]
 
 SHORT_TEXT_TYPES = frozenset({"char", "varchar", "enum"})
 LONG_TEXT_TYPES = frozenset({"tinytext", "text", "mediumtext", "longtext"})
@@ -5317,6 +5384,9 @@ class ColumnDecision:
     column: str
     tenant_column: str | None  # actual tenant column name in this table, if any
     skip_reason: SkipReason | None
+    # "big_table": the table is over max_rows, so the collector must see a loose
+    # index scan in EXPLAIN before it reads the column (Spec 02 4.11).
+    path: ScanPath = "normal"
 
     @property
     def key(self) -> str:
@@ -5325,6 +5395,24 @@ class ColumnDecision:
     @property
     def eligible(self) -> bool:
         return self.skip_reason is None
+
+
+def has_loose_scan_index(table: TableData, column: str, tenant_column: str | None) -> bool:
+    """A BTREE index leads with (tenant_column, column), or column alone without a tenant.
+
+    Prefix parts (`sub_parts` not None) do not count: MySQL cannot loose-scan
+    an index that stores only the first N characters of a value.
+    """
+    leading = [tenant_column.lower()] if tenant_column else []
+    leading.append(column.lower())
+    width = len(leading)
+    for index in table.indexes:
+        if index.index_type.upper() != "BTREE" or len(index.columns) < width:
+            continue
+        names = [name.lower() for name in index.columns[:width]]
+        if names == leading and all(part is None for part in index.sub_parts[:width]):
+            return True
+    return False
 
 
 def _declared_length(column: ColumnData) -> int | None:
@@ -5364,8 +5452,9 @@ def plan_value_columns(
 
     `include` / `exclude` hold `table.column` keys (Spec 05 `columns.yaml`
     `value_index` later feeds them). `exclude` always wins; `include` only lifts
-    the length, name and comment rules: key columns, views, row limits and the
-    tenant rule still apply.
+    the length, name and comment rules: key columns, views, the tenant rule and
+    the big-table index rule still apply. The big-table rule comes last because
+    it is the only one an index can fix.
     """
     tenant = tenant_column.lower() if tenant_column else None
     decisions: list[ColumnDecision] = []
@@ -5375,11 +5464,11 @@ def plan_value_columns(
         if tenant is not None:
             key_columns.add(tenant)
         table_tenant = names.get(tenant) if tenant is not None else None
+        big = table.row_estimate is not None and table.row_estimate > max_rows
+        path: ScanPath = "big_table" if big else "normal"
         table_reason: SkipReason | None = None
         if table.table_type == "VIEW":
             table_reason = "VIEW"
-        elif table.row_estimate is not None and table.row_estimate > max_rows:
-            table_reason = "TOO_MANY_ROWS"
         elif tenant is not None and table_tenant is None:
             table_reason = "NO_TENANT_KEY"
         for column in table.columns:
@@ -5393,7 +5482,13 @@ def plan_value_columns(
                 reason = table_reason
             else:
                 reason = _column_reason(column, key_columns, included=key in include)
-            decisions.append(ColumnDecision(table.name, column.name, table_tenant, reason))
+                if (
+                    reason is None
+                    and big
+                    and not has_loose_scan_index(table, column.name, table_tenant)
+                ):
+                    reason = "BIG_TABLE_NO_INDEX"
+            decisions.append(ColumnDecision(table.name, column.name, table_tenant, reason, path))
     return decisions
 
 
@@ -5434,7 +5529,7 @@ def query_terms(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/metadata/test_value_index.py -v`
-Expected: `7 passed`。
+Expected: `9 passed`。
 
 - [ ] **Step 5: Quality gates**
 
@@ -5451,23 +5546,38 @@ git push origin main
 
 ---
 
-### Task 15: 值采集器 `collector/values.py`（M10、spec 4.11，验收 15 的采集部分）
+### Task 15: 值采集器 `collector/values.py`（M10、spec 4.11，验收 15 的采集部分、验收 18）
 
 **Files:**
 - Create: `src/text2sql/metadata/collector/values.py`
 - Test: `tests/unit/metadata/test_collector_values.py`, `tests/integration/metadata/test_collector_values.py`
+- Modify（Step 7，只在实测结果与预期不同或需要更新核实标记时）: `docs/research/02-value-index-large-tables.md`、`docs/specs/02-metadata.md`
 
 **Interfaces:**
-- Consumes: Task 14 `ColumnDecision`、`plan_value_columns`；Task 5 `collect_snapshot`（集成测试用它拿表结构）；Task 6 `mysql_fixture`。
+- Consumes: Task 14 `ColumnDecision`（含 `path`）、`plan_value_columns`；Task 5 `collect_snapshot`（集成测试用它拿表结构）；Task 6 `mysql_fixture`。
 - Produces（`text2sql.metadata.collector.values`）:
-  - `CollectedColumn(table, column, values: tuple[tuple[str | None, str], ...], skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT"] | None)`，`values` 为 `(tenant_key, value)`，按租户、值排序。
-  - `quote_identifier(name) -> str`（反引号转义）；`distinct_values_sql(table, column, *, tenant_column, timeout_ms) -> str`：`SELECT /*+ MAX_EXECUTION_TIME(ms) */ DISTINCT [tenant,] col FROM t WHERE col IS NOT NULL AND col <> '' LIMIT :limit`。
-  - `collect_values(engine, decisions, *, max_distinct, max_length, timeout_ms) -> list[CollectedColumn]`：只处理 `eligible` 的列，每列一条查询，`LIMIT max_distinct + 1`，超过即 `TOO_MANY_VALUES`；MySQL 错误码 3024（8.0 `MAX_EXECUTION_TIME` 超时）或 1969（MariaDB）记为 `TIMEOUT`，其他错误照常抛出；超过 `max_length` 的值丢弃。
+  - `CollectedColumn(table, column, values: tuple[tuple[str | None, str], ...], skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"] | None)`，`values` 为 `(tenant_key, value)`，按查询返回的顺序。
+  - `quote_identifier(name) -> str`（反引号转义）；`distinct_values_sql(table, column, *, tenant_column, timeout_ms) -> str`：`SELECT /*+ MAX_EXECUTION_TIME(ms) */ DISTINCT [`tenant` AS tenant_key,] `col` AS value FROM t WHERE col IS NOT NULL AND col <> '' AND CHAR_LENGTH(col) <= :max_length LIMIT :limit`。`DISTINCT` 里只放裸列：不写 `CAST(... AS CHAR)`，关闭租户规则时也不写 `NULL AS tenant_key`，租户键在 Python 里转字符串。
+  - `explain_sql(sql) -> str`（`EXPLAIN FORMAT=TRADITIONAL ` + sql）；`LOOSE_SCAN_MARKER = "Using index for group-by"`；`uses_loose_scan(plan_rows) -> bool`：任一行的 `Extra` 含标记。
+  - `collect_values(engine, decisions, *, max_distinct, max_length, timeout_ms) -> list[CollectedColumn]`：只处理 `eligible` 的列，每列一条查询，`LIMIT max_distinct + 1`，超过即 `TOO_MANY_VALUES`；`path == "big_table"` 的列先执行 `explain_sql(...)`，没有松散索引扫描就记 `NO_LOOSE_SCAN` 且不执行取值查询；MySQL 错误码 3024（8.0 `MAX_EXECUTION_TIME` 超时）或 1969（MariaDB）记为 `TIMEOUT`，其他错误照常抛出；超长值在 SQL 的 `WHERE` 里就被过滤。
   - `TIMEOUT_ERROR_CODES = frozenset({3024, 1969})`、`mysql_error_code(exc) -> int | None`。
 
 这是 Spec 02 里唯一读业务行的代码（spec 2.2 的 Profiling 例外，架构 17.1 修订）。约束都在 SQL 里：只用 `get_business_engine()`（`t2s_ro`、只读会话），每列一条带 `MAX_EXECUTION_TIME` 优化器提示的查询（MySQL 5.7.8+ 支持；MariaDB 会忽略这个提示，所以 1969 只是兜底），`LIMIT` 封顶，表名列名只来自快照并经 `quote_identifier` 转义（因此 f-string 那一行的 `# noqa: S608` 是安全的）。
 
 集成测试在夹具表 `t_customer` 里用 root 插 4 行（租户 1001、1002），断言 `code` 列因 `NAME_PATTERN` 跳过、`name` 被收集且按租户分开，`t_work_order` 没有 `tenant_id` 所以 `NO_TENANT_KEY`，视图 `VIEW`；再用 `max_distinct=2` 验证 `TOO_MANY_VALUES`。
+
+大表路径（2026-11-22 修订，spec 4.11）。写计划时在本机容器（5.7.44、8.0.46）上用 10 万行临时表实测过 `EXPLAIN`，结论直接决定了 SQL 的写法：
+
+| 查询（索引 `(tenant_id, status)`，`status` 另有单列索引的表另测） | 5.7.44 `Extra` | 8.0.46 `Extra` |
+| --- | --- | --- |
+| `DISTINCT tenant_id, status` + `WHERE IS NOT NULL / <> '' / CHAR_LENGTH` | `Using where; Using index for group-by; Using temporary` | 同左 |
+| `DISTINCT CAST(tenant_id AS CHAR), status` | `Using index; Using temporary`（全索引扫描 9.4 万行） | 同左（10 万行） |
+| `DISTINCT NULL AS tenant_key, status`（`status` 单列索引） | `Using where; Using index; Using temporary`（扫 5 万行） | 同左 |
+| `DISTINCT status`（`status` 单列索引） | `Using where; Using index for group-by; Using temporary` | 同左 |
+| `DISTINCT tenant_id, channel`（`channel` 无索引） | `Using where; Using temporary`（`type = ALL`） | 同左 |
+| 4 行小表上的 `DISTINCT tenant_id, status` | `Using where; Using index; Using temporary` | 同左 |
+
+所以：`DISTINCT` 里不能有 `CAST` 或常量；`WHERE` 过滤不影响松散扫描；小表优化器不选松散扫描，`EXPLAIN` 门槛只对大表用。集成测试因此自己建一张 10 万行的 `t_order_big`（用 10 行的 `t_digit` 交叉连接生成，root 执行，约 1 秒），并 `ANALYZE TABLE` 让 `TABLE_ROWS` 准确（8.0 的 `information_schema_stats_expiry` 缓存也会被 `ANALYZE TABLE` 刷新）。Step 7 在你本机再跑一次这张表，确认结论没变。
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -5485,8 +5595,10 @@ from sqlalchemy.exc import OperationalError
 from text2sql.metadata.collector.values import (
     collect_values,
     distinct_values_sql,
+    explain_sql,
     mysql_error_code,
     quote_identifier,
+    uses_loose_scan,
 )
 from text2sql.metadata.value_index import ColumnDecision
 
@@ -5499,36 +5611,61 @@ def test_quote_identifier_escapes_backticks() -> None:
 def test_distinct_values_sql_with_and_without_tenant() -> None:
     sql = distinct_values_sql("t_customer", "region", tenant_column="tenant_id", timeout_ms=3000)
     assert sql == (
-        "SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT CAST(`tenant_id` AS CHAR) AS tenant_key, "
+        "SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT `tenant_id` AS tenant_key, "
         "`region` AS value FROM `t_customer` WHERE `region` IS NOT NULL AND `region` <> '' "
         "AND CHAR_LENGTH(`region`) <= :max_length LIMIT :limit"
     )
-    assert "NULL AS tenant_key" in distinct_values_sql(
-        "t_tag", "tag", tenant_column=None, timeout_ms=10
+    # Bare columns only: CAST(...) or a constant would disable the loose index scan.
+    assert distinct_values_sql("t_tag", "tag", tenant_column=None, timeout_ms=10) == (
+        "SELECT /*+ MAX_EXECUTION_TIME(10) */ DISTINCT `tag` AS value FROM `t_tag` "
+        "WHERE `tag` IS NOT NULL AND `tag` <> '' AND CHAR_LENGTH(`tag`) <= :max_length "
+        "LIMIT :limit"
     )
 
 
+def test_uses_loose_scan() -> None:
+    assert explain_sql("SELECT 1") == "EXPLAIN FORMAT=TRADITIONAL SELECT 1"
+    assert uses_loose_scan([{"Extra": "Using where; Using index for group-by; Using temporary"}])
+    assert not uses_loose_scan([{"Extra": "Using where; Using index; Using temporary"}])
+    assert not uses_loose_scan([{"Extra": None}])
+    assert not uses_loose_scan([])
+
+
 class _Result:
-    def __init__(self, rows: list[tuple[Any, Any]]) -> None:
+    def __init__(self, rows: list[Any]) -> None:
         self._rows = rows
 
-    def all(self) -> list[tuple[Any, Any]]:
+    def all(self) -> list[Any]:
         return self._rows
+
+    def mappings(self) -> "_Result":
+        return self
 
 
 class _Conn:
-    def __init__(self, answers: Mapping[str, list[tuple[Any, Any]] | Exception]) -> None:
+    """Answers by column name; EXPLAIN statements read `explains`, others `answers`."""
+
+    def __init__(
+        self,
+        answers: Mapping[str, list[Any] | Exception],
+        explains: Mapping[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.answers = answers
+        self.explains = explains or {}
+        self.statements: list[str] = []
         self.params: list[Mapping[str, Any]] = []
 
     def execute(self, statement: Any, params: Mapping[str, Any]) -> _Result:
+        sql = str(statement)
+        self.statements.append(sql)
         self.params.append(params)
-        for column, answer in self.answers.items():
-            if f"`{column}` AS value" in str(statement):
+        source: Mapping[str, Any] = self.explains if sql.startswith("EXPLAIN") else self.answers
+        for column, answer in source.items():
+            if f"`{column}` AS value" in sql:
                 if isinstance(answer, Exception):
                     raise answer
                 return _Result(answer)
-        raise AssertionError(statement)
+        raise AssertionError(sql)
 
 
 class _Engine:
@@ -5551,9 +5688,10 @@ def _timeout(code: int) -> OperationalError:
 def test_collect_values_classifies_columns() -> None:
     conn = _Conn(
         {
-            "region": [("1001", "华东区"), ("1002", b"\xe5\x8d\x8e\xe5\x8d\x97")],
+            "region": [(1001, "华东区"), ("1002", b"\xe5\x8d\x8e\xe5\x8d\x97")],
             "level": [(None, "A"), (None, "B"), (None, "C")],
             "slow": _timeout(3024),
+            "tag": [("vip",)],
         }
     )
     decisions = [
@@ -5561,6 +5699,7 @@ def test_collect_values_classifies_columns() -> None:
         _decision("level"),
         _decision("slow"),
         _decision("skipped", "NAME_PATTERN"),
+        ColumnDecision("t_tag", "tag", None, None),
     ]
     collected = collect_values(
         cast(Engine, _Engine(conn)), decisions, max_distinct=2, max_length=64, timeout_ms=100
@@ -5569,8 +5708,34 @@ def test_collect_values_classifies_columns() -> None:
         ("t_customer.region", None, (("1001", "华东区"), ("1002", "华南"))),
         ("t_customer.level", "TOO_MANY_VALUES", ()),
         ("t_customer.slow", "TIMEOUT", ()),
+        ("t_tag.tag", None, ((None, "vip"),)),
     ]
     assert conn.params[0] == {"max_length": 64, "limit": 3}
+    assert not any(sql.startswith("EXPLAIN") for sql in conn.statements)  # normal path
+
+
+def test_big_table_columns_are_read_only_through_a_loose_index_scan() -> None:
+    conn = _Conn(
+        {"status": [(1001, "PAID"), (1002, "NEW")]},
+        explains={
+            "status": [{"id": 1, "Extra": "Using where; Using index for group-by"}],
+            "note": [{"id": 1, "Extra": "Using where; Using index; Using temporary"}],
+        },
+    )
+    decisions = [
+        ColumnDecision("t_order", "status", "tenant_id", None, "big_table"),
+        ColumnDecision("t_order", "note", "tenant_id", None, "big_table"),
+    ]
+    collected = collect_values(
+        cast(Engine, _Engine(conn)), decisions, max_distinct=10, max_length=64, timeout_ms=100
+    )
+    assert [(c.key, c.skip_reason, c.values) for c in collected] == [
+        ("t_order.status", None, (("1001", "PAID"), ("1002", "NEW"))),
+        ("t_order.note", "NO_LOOSE_SCAN", ()),
+    ]
+    # `note` is never queried: EXPLAIN alone decided to skip it.
+    assert [sql.split(" ", 1)[0] for sql in conn.statements] == ["EXPLAIN", "SELECT", "EXPLAIN"]
+    assert conn.params[0] == conn.params[1] == {"max_length": 64, "limit": 11}
 
 
 def test_other_operational_errors_propagate() -> None:
@@ -5641,7 +5806,59 @@ def test_collects_distinct_values_with_tenant_keys(mysql_fixture: MysqlFixture) 
     assert [(c.key, c.skip_reason, c.values) for c in too_many] == [
         ("t_customer.name", "TOO_MANY_VALUES", ())
     ]
+
+
+# Spec 02 acceptance 18: a 100 000-row table. `t_digit` x5 generates the rows in about a
+# second; ANALYZE TABLE makes TABLE_ROWS accurate (and refreshes the 8.0 stats cache).
+BIG_TABLE_SETUP = (
+    "CREATE TABLE t_digit (d INT NOT NULL)",
+    "INSERT INTO t_digit VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)",
+    """
+    CREATE TABLE t_order_big (
+      id INT NOT NULL AUTO_INCREMENT,
+      tenant_id INT NOT NULL,
+      status VARCHAR(16) NULL,
+      channel VARCHAR(16) NULL,
+      PRIMARY KEY (id),
+      KEY ix_tenant_status (tenant_id, status)
+    ) ENGINE=InnoDB
+    """,
+    # Even n -> tenant 1001 with PAID/NEW; odd n -> tenant 1002 with REFUND/NULL.
+    """
+    INSERT INTO t_order_big (tenant_id, status, channel)
+    SELECT 1001 + (n % 2),
+           ELT(1 + (n % 4), 'PAID', 'REFUND', 'NEW', NULL),
+           ELT(1 + (n % 3), 'web', 'app', '')
+    FROM (SELECT a.d + 10 * b.d + 100 * c.d + 1000 * e.d + 10000 * f.d AS n
+          FROM t_digit a, t_digit b, t_digit c, t_digit e, t_digit f) AS nums
+    """,
+    "ANALYZE TABLE t_order_big",
+)
+
+
+def test_big_table_is_read_through_its_index(mysql_fixture: MysqlFixture) -> None:
+    for sql in BIG_TABLE_SETUP:
+        mysql_fixture.execute(sql)
+    engine = get_business_engine()
+    data = collect_snapshot(engine, mysql_fixture.datasource_id)
+    decisions = {
+        d.key: d for d in plan_value_columns(data.tables, tenant_column="tenant_id", max_rows=1000)
+    }
+    status = decisions["t_order_big.status"]
+    assert (status.skip_reason, status.path) == (None, "big_table")
+    assert decisions["t_order_big.channel"].skip_reason == "BIG_TABLE_NO_INDEX"
+    assert decisions["t_customer.name"].path == "normal"
+
+    collected = collect_values(engine, [status], max_distinct=10, max_length=128, timeout_ms=3000)
+    assert [(c.key, c.skip_reason) for c in collected] == [("t_order_big.status", None)]
+    assert sorted(collected[0].values) == [
+        ("1001", "NEW"),
+        ("1001", "PAID"),
+        ("1002", "REFUND"),
+    ]
 ```
+
+如果 `status` 被记成 `NO_LOOSE_SCAN`，不要放宽断言：先跑 Step 7 看 `Extra`，再对照上面的实测表判断是 SQL 写法问题还是版本差异。
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -5664,9 +5881,11 @@ column:
 * `LIMIT max_distinct + 1` tells "too many values" apart without counting.
 * the tenant column is selected next to the value, so search can filter by
   tenant and the index never leaks values across tenants.
+* big tables (`path == "big_table"`) are read only when EXPLAIN shows a loose
+  index scan, whose cost depends on the number of distinct values, not rows.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -5677,6 +5896,9 @@ from text2sql.metadata.value_index import ColumnDecision
 
 # MySQL ER_QUERY_TIMEOUT (MAX_EXECUTION_TIME exceeded); MariaDB ER_STATEMENT_TIMEOUT.
 TIMEOUT_ERROR_CODES = frozenset({3024, 1969})
+LOOSE_SCAN_MARKER = "Using index for group-by"
+
+CollectSkipReason = Literal["TOO_MANY_VALUES", "TIMEOUT", "NO_LOOSE_SCAN"]
 
 
 @dataclass(frozen=True)
@@ -5684,7 +5906,7 @@ class CollectedColumn:
     table: str
     column: str
     values: tuple[tuple[str | None, str], ...]  # (tenant_key, value), empty when skipped
-    skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT"] | None
+    skip_reason: CollectSkipReason | None
 
     @property
     def key(self) -> str:
@@ -5699,15 +5921,27 @@ def distinct_values_sql(
     table: str, column: str, *, tenant_column: str | None, timeout_ms: int
 ) -> str:
     col = quote_identifier(column)
-    tenant = f"CAST({quote_identifier(tenant_column)} AS CHAR)" if tenant_column else "NULL"
+    # Bare columns only: CAST(...) or a constant in the DISTINCT list stops MySQL
+    # from using a loose index scan (Spec 02 4.11, measured on 5.7 and 8.0).
+    selected = f"{col} AS value"
+    if tenant_column:
+        selected = f"{quote_identifier(tenant_column)} AS tenant_key, {selected}"
     # Identifiers come from the snapshot and are backtick-quoted; values are bound.
     return (
-        f"SELECT /*+ MAX_EXECUTION_TIME({int(timeout_ms)}) */ DISTINCT "  # noqa: S608
-        f"{tenant} AS tenant_key, {col} AS value "
+        f"SELECT /*+ MAX_EXECUTION_TIME({int(timeout_ms)}) */ DISTINCT {selected} "  # noqa: S608
         f"FROM {quote_identifier(table)} "
         f"WHERE {col} IS NOT NULL AND {col} <> '' AND CHAR_LENGTH({col}) <= :max_length "
         "LIMIT :limit"
     )
+
+
+def explain_sql(sql: str) -> str:
+    # TRADITIONAL keeps the `Extra` column even if 8.0.32+ `explain_format` is changed.
+    return f"EXPLAIN FORMAT=TRADITIONAL {sql}"
+
+
+def uses_loose_scan(plan_rows: Iterable[Mapping[Any, Any]]) -> bool:
+    return any(LOOSE_SCAN_MARKER in (row.get("Extra") or "") for row in plan_rows)
 
 
 def mysql_error_code(exc: OperationalError) -> int | None:
@@ -5717,6 +5951,12 @@ def mysql_error_code(exc: OperationalError) -> int | None:
 
 def _text(value: Any) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+def _pair(row: Sequence[Any], *, has_tenant: bool) -> tuple[str | None, str]:
+    if not has_tenant:
+        return None, _text(row[0])
+    return (None if row[0] is None else _text(row[0])), _text(row[1])
 
 
 def collect_values(
@@ -5739,10 +5979,16 @@ def collect_values(
                 tenant_column=decision.tenant_column,
                 timeout_ms=timeout_ms,
             )
+            params = {"max_length": max_length, "limit": max_distinct + 1}
             try:
-                rows = conn.execute(
-                    text(sql), {"max_length": max_length, "limit": max_distinct + 1}
-                ).all()
+                if decision.path == "big_table":
+                    plan = conn.execute(text(explain_sql(sql)), params).mappings().all()
+                    if not uses_loose_scan(plan):
+                        collected.append(
+                            CollectedColumn(decision.table, decision.column, (), "NO_LOOSE_SCAN")
+                        )
+                        continue
+                rows = conn.execute(text(sql), params).all()
             except OperationalError as exc:
                 if mysql_error_code(exc) not in TIMEOUT_ERROR_CODES:
                     raise
@@ -5753,9 +5999,8 @@ def collect_values(
                     CollectedColumn(decision.table, decision.column, (), "TOO_MANY_VALUES")
                 )
                 continue
-            values = tuple(
-                (None if tenant is None else _text(tenant), _text(value)) for tenant, value in rows
-            )
+            has_tenant = decision.tenant_column is not None
+            values = tuple(_pair(row, has_tenant=has_tenant) for row in rows)
             collected.append(CollectedColumn(decision.table, decision.column, values, None))
     return collected
 ```
@@ -5763,22 +6008,65 @@ def collect_values(
 - [ ] **Step 5: Run unit tests**
 
 Run: `uv run pytest tests/unit/metadata/test_collector_values.py -v`
-Expected: `5 passed`。
+Expected: `7 passed`。
 
 - [ ] **Step 6: Run integration test**
 
 Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_collector_values.py -v`
-Expected: `2 passed`（`mysql57`、`mysql80` 各一次）。
+Expected: `4 passed`（两个测试 × `mysql57`、`mysql80`）。
 
-- [ ] **Step 7: Quality gates**
+- [ ] **Step 7: 在本机 5.7（3307）和 8.0（3308）上记录 EXPLAIN（spec 4.11 的「待 Task 15 确认」）**
+
+用 root 在 `t2s_business` 里建**临时表**（`CREATE TEMPORARY TABLE` 只在本连接可见，断开即消失，不改业务库），分别看「普通表」（4 行）和「大表」（10 万行）上同一条采集 SQL 的 `Extra`：
+
+```bash
+cat > /tmp/t2s_loose_probe.sql <<'EOF'
+CREATE TEMPORARY TABLE probe_digit (d INT NOT NULL);
+INSERT INTO probe_digit VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+CREATE TEMPORARY TABLE probe_big (id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT NOT NULL,
+  status VARCHAR(16), channel VARCHAR(16), KEY ix_tenant_status (tenant_id, status)) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE probe_small LIKE probe_big;
+CREATE TEMPORARY TABLE d2 LIKE probe_digit; INSERT INTO d2 SELECT * FROM probe_digit;
+CREATE TEMPORARY TABLE d3 LIKE probe_digit; INSERT INTO d3 SELECT * FROM probe_digit;
+CREATE TEMPORARY TABLE d4 LIKE probe_digit; INSERT INTO d4 SELECT * FROM probe_digit;
+CREATE TEMPORARY TABLE d5 LIKE probe_digit; INSERT INTO d5 SELECT * FROM probe_digit;
+INSERT INTO probe_big (tenant_id, status, channel)
+SELECT 1001 + (n % 2), ELT(1 + (n % 4), 'PAID', 'REFUND', 'NEW', NULL), ELT(1 + (n % 3), 'web', 'app', '')
+FROM (SELECT a.d + 10*b.d + 100*c.d + 1000*e.d + 10000*f.d AS n
+      FROM probe_digit a, d2 b, d3 c, d4 e, d5 f) AS nums;
+INSERT INTO probe_small (tenant_id, status) VALUES (1001,'PAID'),(1001,'REFUND'),(1002,'PAID'),(1002,'NEW');
+ANALYZE TABLE probe_big, probe_small;
+EXPLAIN FORMAT=TRADITIONAL SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT `tenant_id` AS tenant_key, `status` AS value FROM `probe_small` WHERE `status` IS NOT NULL AND `status` <> '' AND CHAR_LENGTH(`status`) <= 128 LIMIT 5001;
+EXPLAIN FORMAT=TRADITIONAL SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT `tenant_id` AS tenant_key, `status` AS value FROM `probe_big` WHERE `status` IS NOT NULL AND `status` <> '' AND CHAR_LENGTH(`status`) <= 128 LIMIT 5001;
+EXPLAIN FORMAT=TRADITIONAL SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT `tenant_id` AS tenant_key, `channel` AS value FROM `probe_big` WHERE `channel` IS NOT NULL AND `channel` <> '' AND CHAR_LENGTH(`channel`) <= 128 LIMIT 5001;
+EXPLAIN FORMAT=TRADITIONAL SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT CAST(`tenant_id` AS CHAR) AS tenant_key, `status` AS value FROM `probe_big` LIMIT 5001;
+EOF
+for svc in mysql57 mysql80; do
+  echo "== $svc"
+  docker compose -f deployment/compose.yaml exec -T $svc mysql -uroot -proot_local_only t2s_business < /tmp/t2s_loose_probe.sql 2>/dev/null | grep -v "^Table"
+done
+rm /tmp/t2s_loose_probe.sql
+```
+
+（同一个临时表在一条语句里不能出现两次，所以交叉连接用了 5 张 `probe_digit` 副本。）
+
+Expected（两个版本相同，和写计划时的实测一致）：
+1. `probe_small`（普通表）：`type = index`，`Extra = Using where; Using index; Using temporary`——**没有** `Using index for group-by`，所以普通表不做 EXPLAIN 门槛是对的。
+2. `probe_big` 的 `status`（大表、有索引）：`type = range`，`Extra = Using where; Using index for group-by; Using temporary`——`WHERE` 过滤不影响松散扫描。
+3. `probe_big` 的 `channel`（大表、无索引）：`type = ALL`，`Extra = Using where; Using temporary`。
+4. 旧写法 `CAST(...)`：`type = index`、`Extra = Using index; Using temporary`——松散扫描失效。
+
+结果一致时，把 `docs/specs/02-metadata.md` 4.11 和 `docs/research/02-value-index-large-tables.md` 里的「**[待 Task 15 在 5.7 / 8.0 夹具上再次 EXPLAIN 确认]**」改成「**[已核实 <日期>，5.7.x / 8.0.x]**」（填 `SELECT VERSION()` 的实际版本）。第 2 条如果**没有** `Using index for group-by`，说明这个版本上 `WHERE` 让松散扫描失效：停下来，按 spec 4.11 的备选方案（大表 SQL 去掉 `WHERE`、在 Python 里过滤）先改 spec 再改代码，不要只改代码。
+
+- [ ] **Step 8: Quality gates**
 
 Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
 Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
 
-- [ ] **Step 8: Commit and push**
+- [ ] **Step 9: Commit and push**
 
 ```bash
-git add src/text2sql/metadata/collector/values.py tests/unit/metadata/test_collector_values.py tests/integration/metadata/test_collector_values.py
+git add src/text2sql/metadata/collector/values.py tests/unit/metadata/test_collector_values.py tests/integration/metadata/test_collector_values.py docs/specs/02-metadata.md docs/research/02-value-index-large-tables.md
 git commit -m "feat(metadata): collect distinct values of eligible columns with bounded queries"
 git push origin main
 ```
@@ -7286,7 +7574,7 @@ git push origin main
 
 ---
 
-### Task 19: 文档与整体验收（验收 1–16）
+### Task 19: 文档与整体验收（验收 1–18）
 
 **Files:**
 - Modify: `README.md`（在「本地开发」末尾追加小节）、`AGENTS.md`（状态行 + 命令）
@@ -7360,6 +7648,8 @@ Append to `README.md`:
 14. `tests/unit/metadata/test_value_index.py`（各跳过原因、include/exclude 优先级）。
 15. `tests/integration/metadata/test_collector_values.py`（5.7、8.0 各一次）、`tests/unit/metadata/test_collector_values.py`、`test_sync.py::test_value_index_job_builds_from_latest_snapshot`、`tests/integration/metadata/test_cli.py::test_structure_and_values_commands`。
 16. `test_value_store.py`（精确 + 模糊、按租户隔离、只留 2 次构建）、`tests/integration/test_migrations.py`（`pg_trgm` 已安装、3 张值索引表随 0002 建出和回滚）。
+17. `tests/unit/metadata/test_value_index.py::test_big_tables_need_a_full_leading_index`、`::test_big_table_rule_without_tenant_and_with_include`。
+18. `tests/unit/metadata/test_collector_values.py::test_big_table_columns_are_read_only_through_a_loose_index_scan`、`tests/integration/metadata/test_collector_values.py::test_big_table_is_read_through_its_index`（5.7、8.0 各一次）；Task 15 Step 7 的 EXPLAIN 记录已写进 research 02。
 
 - [ ] **Step 4: Commit and push**
 
@@ -7386,9 +7676,9 @@ git push origin main
 | M7 STALE 存储（部分唯一、重复标记追加、`StaleSet`、不缓存） | 7、12 |
 | M8 CLI 全部子命令；队列 `metadata.sync`；不可重试错误；开始/结束日志 | 17、18 |
 | M9 表族与公共列（同词干 + 同列签名、代表表、公共列阈值、不进哈希；CLI `structure`） | 13、18 |
-| M10 值索引（选列规则与跳过原因、有界采集、超时、3 张表与 `pg_trgm`、保留 2 次构建、按租户精确 + 模糊检索、队列 `metadata.value_index`、CLI `values`、`VALUE_INDEX_NOT_FOUND`） | 2、7、14、15、16、17、18 |
+| M10 值索引（选列规则与跳过原因、大表索引路径与 EXPLAIN 门槛、有界采集、超时、3 张表与 `pg_trgm`、保留 2 次构建、按租户精确 + 模糊检索、队列 `metadata.value_index`、CLI `values`、`VALUE_INDEX_NOT_FOUND`） | 2、7、14、15、16、17、18 |
 | 4.1 `T2S_DATASOURCE_ID`、`value_index_*`、`.env.example` 用 `local_mysql80`、`METADATA_NO_DATABASE` | 2、5 |
-| §5 验收 1–16 | 19（逐条映射到测试） |
+| §5 验收 1–18 | 19（逐条映射到测试） |
 | §6 无新增依赖 | Global Constraints |
 
 ### 2. Placeholder scan
