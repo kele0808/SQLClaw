@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 按 `docs/specs/02-metadata.md`（状态：已确认）实现元数据目录：把业务 MySQL（5.7 / 8.0）的结构采集成不可变快照存入 PostgreSQL，按内容哈希去重，给表和字段分配跨版本稳定的 `object_uuid`，对注释做注入检测并支持人工复核，提供 release 与发布指针、STALE 标记存储，以及 CLI 和队列任务 `metadata.sync`。第 1 周交付「元数据快照可查询」。
+> **修订（2026-11-22）：** spec 02 采纳大 Schema 调研（`docs/research/01-text2sql-sota.md`）后新增 M9 表族与公共列、M10 值索引。本计划随之修改 Task 1（错误码改为 4.12，加 `VALUE_INDEX_NOT_FOUND`）、Task 2（`value_index_*` 配置）、Task 7（3 张值索引表与 `pg_trgm` 进 0002），新增 Task 13–16，原 Task 13–15 顺延为 17–19 并扩展到值索引任务、CLI 和验收 13–16。待确认 1–8 不变。
 
-**Architecture:** 新代码在 `src/text2sql/metadata/`（领域模型 `snapshot.py`、采集器 `collector/mysql.py`、ORM 与仓库 `catalog/`、`identity.py`、`comment_review.py`、`release.py`、`stale.py`、`jobs.py`、`cli.py`）和 `src/text2sql/security/prompt_guard.py`。采集器只用 Spec 01 的只读 `get_business_engine()` 读 `information_schema`；写 PG 的函数都接收调用方的 `Session`，事务由调用方（`session_scope()`、worker、CLI）掌握，与 Spec 01 队列的约定一致。不可变性由「应用层只有插入函数」加 PG 触发器双重保证。单元测试不连库；集成测试复用 Spec 01 的 `integration` 标记与 fixture，对 `mysql57`、`mysql80` 各跑一遍。
+**Goal:** 按 `docs/specs/02-metadata.md`（状态：已确认）实现元数据目录：把业务 MySQL（5.7 / 8.0）的结构采集成不可变快照存入 PostgreSQL，按内容哈希去重，给表和字段分配跨版本稳定的 `object_uuid`，对注释做注入检测并支持人工复核，提供 release 与发布指针、STALE 标记存储，以及 CLI 和队列任务 `metadata.sync`；并按 2026-11-22 修订（采纳大 Schema 调研）加入表族与公共列（M9）和按租户隔离的值索引（M10，PostgreSQL `pg_trgm` 精确 + 模糊匹配，队列任务 `metadata.value_index`）。第 1 周交付「元数据快照可查询」和值索引。
 
-**Tech Stack:** Python 3.12、uv、pydantic v2（frozen 模型）、SQLAlchemy 2.x（psycopg v3 / PyMySQL，`postgresql.insert … on_conflict_do_update`、`ARRAY`、`Uuid`）、Alembic、PL/pgSQL 触发器、argparse、pytest、ruff、mypy strict。
+**Architecture:** 新代码在 `src/text2sql/metadata/`（领域模型 `snapshot.py`、采集器 `collector/mysql.py`、ORM 与仓库 `catalog/`、`identity.py`、`comment_review.py`、`release.py`、`stale.py`、表族 `structure.py`、值索引规则 `value_index.py`、值采集 `collector/values.py`、值存储与检索 `catalog/value_store.py`、`jobs.py`、`cli.py`）和 `src/text2sql/security/prompt_guard.py`。结构采集器只用 Spec 01 的只读 `get_business_engine()` 读 `information_schema`；值采集器是唯一读业务行的代码，同样只用 `t2s_ro`，每列一条带 `MAX_EXECUTION_TIME` 和 `LIMIT` 的 `DISTINCT` 查询；写 PG 的函数都接收调用方的 `Session`，事务由调用方（`session_scope()`、worker、CLI）掌握，与 Spec 01 队列的约定一致。不可变性由「应用层只有插入函数」加 PG 触发器双重保证。单元测试不连库；集成测试复用 Spec 01 的 `integration` 标记与 fixture，对 `mysql57`、`mysql80` 各跑一遍。
+
+**Tech Stack:** Python 3.12、uv、pydantic v2（frozen 模型）、SQLAlchemy 2.x（psycopg v3 / PyMySQL，`postgresql.insert … on_conflict_do_update`、`ARRAY`、`Uuid`）、Alembic、PL/pgSQL 触发器、PostgreSQL `pg_trgm`（`word_similarity`、GIN `gin_trgm_ops`）、argparse、pytest、ruff、mypy strict。
 
 ## 待确认（开始 Task 1 前请用户逐条确认；括号里是本计划采用的方案，后面的代码都按它写）
 
@@ -27,7 +29,7 @@
 8. **同一注释重复复核。** `metadata_comment_review` 有唯一约束 `(datasource_id, object_type, object_key, comment_hash)`，spec 没说第二次复核同一文本怎么办（直接插入会违反唯一约束）。
    （方案：upsert，后一次覆盖前一次的决定、复核人和备注。）
 
-另外两条 spec §7 的「开放决策」（真实目标库画像、注释复核人）不影响本计划的实现，仍待用户提供。
+另外三条 spec §7 的「开放决策」（真实目标库画像、注释复核人、值索引的租户列名是否统一及命中值能否进入 LLM 上下文）不影响本计划的实现，仍待用户提供；第 3 条按 spec 默认实现（单一 `value_index_tenant_column`，敏感列不入索引）。
 
 以下是实现细节上的选择，不改变 spec 语义，列出来便于审阅：视图在 `TABLES` 里的 `TABLE_COMMENT` 是字面量 `"VIEW"`，归一为空串；`GENERATION_EXPRESSION` 空串记为 `None`；外键查询用 `LEFT JOIN REFERENTIAL_CONSTRAINTS`；`metadata_foreign_key` 加唯一 `(table_id, constraint_name)`；`target_key()` 遇到 5.7/8.0 以外版本抛 `METADATA_UNSUPPORTED_VERSION`；spec 没写类型的列按下面 Task 7 的模型定义（`String(16)` 枚举类列、`Text` 注释和表达式列）。
 
@@ -48,7 +50,9 @@
 | root 经 PyMySQL TCP 登录 | 成功（`mysql_native_password`） | 成功（`caching_sha2_password`，fast-auth） |
 | `information_schema_stats_expiry` | 无此变量 | 86400（`TABLE_ROWS` 有缓存） |
 
-另外，计划里的全部代码已在一个临时副本中逐任务回放过：每个任务的「先失败」与「再通过」结果、ruff / mypy strict / 单元测试都与下文的 Expected 一致；迁移、触发器、仓库、release（含并发）、STALE、注释复核的集成测试在 PostgreSQL 上全部通过。真 MySQL 5.7/8.0 上的建表类集成测试（Task 6、13、14 的 `mysql_fixture`）因为要写库，没有在你的容器上跑——是在 MariaDB 11.8 上验证的，除了三处 MariaDB 特有差异（版本号 11.x、`COLUMN_DEFAULT` 带引号、`t2s_ro` 看不到 `REFERENTIAL_CONSTRAINTS`）外都通过。MySQL 8.0 的 `information_schema` 视图按 `CAN_ACCESS_TABLE` 过滤，有表级 SELECT 就能看到外键规则，所以 Task 6 断言 `on_delete == "CASCADE"`；如果在 5.7 上这条失败，说明 5.7 对 `REFERENTIAL_CONSTRAINTS` 的可见性不同，先把失败值告诉用户再决定。
+值索引另做了两项核对：在你的 Compose PG（`pgvector/pgvector:pg16`）的 `t2s_test` 库执行 `CREATE EXTENSION pg_trgm` 成功；在 PG 16（`en_US.utf8`）和 PG 17（`C.UTF-8`）上 `word_similarity('华东精密', '华东精密有限公司') = 0.8`，中文 trigram 可用。`MAX_EXECUTION_TIME` 优化器提示是 MySQL 5.7.8+ 的语法，没有在你的 5.7/8.0 容器上触发过真实超时（超时分支由单元测试用替身覆盖）。
+
+另外，计划里的全部代码已在一个临时副本中逐任务回放过：每个任务的「先失败」与「再通过」结果、ruff / mypy strict / 单元测试都与下文的 Expected 一致；迁移、触发器、仓库、release（含并发）、STALE、注释复核的集成测试在 PostgreSQL 上全部通过。真 MySQL 5.7/8.0 上的建表类集成测试（Task 6、15、17、18 的 `mysql_fixture`）因为要写库，没有在你的容器上跑——是在 MariaDB 11.8 上验证的，除了三处 MariaDB 特有差异（版本号 11.x、`COLUMN_DEFAULT` 带引号、`t2s_ro` 看不到 `REFERENTIAL_CONSTRAINTS`）外都通过。MySQL 8.0 的 `information_schema` 视图按 `CAN_ACCESS_TABLE` 过滤，有表级 SELECT 就能看到外键规则，所以 Task 6 断言 `on_delete == "CASCADE"`；如果在 5.7 上这条失败，说明 5.7 对 `REFERENTIAL_CONSTRAINTS` 的可见性不同，先把失败值告诉用户再决定。
 
 ## Global Constraints
 
@@ -56,9 +60,10 @@
 - Python 3.12 via uv；**无新增依赖**（spec §6：pydantic、SQLAlchemy、PyMySQL、psycopg 已由 Spec 01 引入）。不要运行 `uv add`。
 - Quality gates (must pass at the end of every task): `uv run ruff format .`、`uv run ruff check .`（E,F,W,I,B,UP,SIM,S,N；tests 只忽略 S101）、`uv run mypy`（strict，src 与 tests）、`uv run pytest`。集成测试：`set -a && source .env && set +a && uv run pytest -m integration`。
 - `tests/conftest.py` 不整体替换；本计划没有新增 `lru_cache` 函数，`_CACHED_FUNCS` 保持不变。
-- 新迁移只有 `migrations/versions/0002_metadata.py`，`down_revision = "0001"`；`alembic downgrade 0001` 必须能回滚。
+- 新迁移只有 `migrations/versions/0002_metadata.py`，`down_revision = "0001"`；第一句 `CREATE EXTENSION IF NOT EXISTS pg_trgm`，值索引的 3 张表也在这里；`alembic downgrade 0001` 必须能回滚（删表，不卸载 `pg_trgm`）。
 - `Settings.datasource_id`：环境变量 `T2S_DATASOURCE_ID`，`^[a-z0-9_]{1,64}$`，默认 `"local"`；`.env.example` 设 `local_mysql80`。一个进程对应一个数据源；采集目标是 `business_db_url` 的默认库（`SELECT DATABASE()`），为空报 `METADATA_NO_DATABASE`。
-- 采集只用 `get_business_engine()`（`t2s_ro`、只读会话），只读 `information_schema` 和会话变量，不读业务数据；所有列显式写别名。
+- 结构采集只用 `get_business_engine()`（`t2s_ro`、只读会话），只读 `information_schema` 和会话变量，不读业务数据；所有列显式写别名。
+- 值索引（spec 4.11）是唯一例外：同样只用 `t2s_ro`；只收通过 `plan_value_columns` 规则的低基数短文本列；每列一条 `SELECT /*+ MAX_EXECUTION_TIME(ms) */ DISTINCT … LIMIT max_distinct+1`；值按 `(tenant_key, value)` 存储，`search_values` 总是按租户过滤；值是不可信数据，以后进入 LLM 上下文时与注释一样按数据而非指令处理（Spec 08）。配置 `value_index_*` 见 Task 2。
 - 版本门槛：低于 5.7.8 报 `METADATA_UNSUPPORTED_VERSION`；超过 2000 表或 50000 字段报 `METADATA_TOO_LARGE`。
 - `content_hash = sha256(canonical_json(SnapshotData 去掉 collected_at、row_estimate))`；canonical JSON：键排序、表按名、字段按 `ordinal_position`、索引按名、外键按约束名。
 - 6 张快照表（`metadata_snapshot`、`metadata_table`、`metadata_column`、`metadata_index`、`metadata_foreign_key`、`metadata_view`）：应用层只有插入；触发器 `BEFORE UPDATE OR DELETE` 抛 `snapshot rows are immutable`。`metadata_datasource` 是唯一可变的元数据表。
@@ -67,8 +72,8 @@
 - `scan_text` 规则码：`INSTRUCTION_OVERRIDE`、`ROLE_PLAY`、`PRIVILEGE_REQUEST`、`CODE_OR_MARKUP`、`URL`、`TOO_LONG`（> 500 字符），正则大小写不敏感。
 - 写 PG 的函数都接收调用方的 `Session`，不自己提交（与 Spec 01 队列约定一致）。
 - `activate_release` 在 `Settings.env == "prod"` 时抛 `AppError("RELEASE_GATE_REQUIRED", …, 409)`。
-- 队列：`@register("metadata.sync")`，payload `{"datasource_id": str, "requested_by": str}`；`datasource_id` 不等于 `Settings.datasource_id` 时抛 `NonRetryableJobError`（直接 `failed`）。日志：采集开始、结束各一条，含 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`、`trace_id`。
-- 本期不做（spec 2.2）：HTTP 接口、Schema Diff、定时采集、Profiling、Embedding、分区/存储过程/触发器/CHECK 采集、多库数据源。
+- 队列：`@register("metadata.sync")`、`@register("metadata.value_index")`，payload `{"datasource_id": str, "requested_by": str}`（值索引可选 `include` / `exclude`）；`datasource_id` 不等于 `Settings.datasource_id` 时抛 `NonRetryableJobError`（直接 `failed`）。日志：采集开始、结束各一条，含 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`、`trace_id`。
+- 本期不做（spec 2.2）：HTTP 接口、Schema Diff、定时采集、Profiling（值索引之外的数据画像）、Embedding、值索引的增量构建与按表租户列、推断关系证据、分区/存储过程/触发器/CHECK 采集、多库数据源。
 - Code, identifiers, commit messages in English; prose may be Chinese. 每个任务结束：gates 通过 → commit → `git push origin main`。
 
 ---
@@ -78,26 +83,30 @@
 | Path | Responsibility | Task |
 | --- | --- | --- |
 | `docs/specs/02-metadata.md` | 按待确认修订 | 1 |
-| `src/text2sql/common/config.py`, `.env.example` | `datasource_id`；admin 测试 URL | 2, 6 |
-| `src/text2sql/common/errors.py` | 元数据错误码 | 2 |
+| `src/text2sql/common/config.py`, `.env.example` | `datasource_id`、`value_index_*`；admin 测试 URL | 2, 6 |
+| `src/text2sql/common/errors.py` | 元数据与值索引错误码 | 2 |
 | `src/text2sql/security/__init__.py`, `src/text2sql/security/prompt_guard.py` | 注释注入规则 | 3 |
 | `src/text2sql/metadata/__init__.py`, `src/text2sql/metadata/snapshot.py` | frozen 领域模型、版本解析、内容哈希 | 4 |
 | `tests/metadata_factories.py` | 测试造数（单元 + 集成共用） | 4 |
 | `src/text2sql/metadata/collector/__init__.py`, `collector/mysql.py` | `information_schema` 采集 | 5 |
 | `tests/integration/metadata/__init__.py`, `conftest.py` | MySQL 夹具库；`metadata_db` 清理 | 6, 7 |
-| `src/text2sql/metadata/catalog/__init__.py`, `catalog/models.py` | 13 个 ORM 模型 | 7 |
-| `migrations/env.py`, `migrations/versions/0002_metadata.py` | 注册模型；建表与触发器 | 7 |
+| `src/text2sql/metadata/catalog/__init__.py`, `catalog/models.py` | 16 个 ORM 模型 | 7 |
+| `migrations/env.py`, `migrations/versions/0002_metadata.py` | 注册模型；`pg_trgm`、建表与触发器 | 7 |
 | `src/text2sql/metadata/identity.py` | `object_uuid` 分配与退役 | 8 |
 | `src/text2sql/metadata/catalog/repository.py` | 保存、去重、加载、列表 | 9 |
 | `src/text2sql/metadata/comment_review.py` | 复核记录、注释可见性 | 10 |
 | `src/text2sql/metadata/release.py` | release、指针、事件 | 11 |
 | `src/text2sql/metadata/stale.py` | STALE 标记、`StaleSet` | 12 |
-| `src/text2sql/metadata/jobs.py`, `src/text2sql/jobs/worker.py` | `run_sync`、`metadata.sync`；worker 加载 handler 模块 | 13 |
-| `src/text2sql/metadata/__main__.py`, `src/text2sql/metadata/cli.py` | CLI | 14 |
-| `README.md`, `AGENTS.md` | 文档 | 15 |
-| `tests/unit/security/*`, `tests/unit/metadata/*`, `tests/integration/metadata/*`, `tests/unit/test_config.py`, `tests/integration/test_migrations.py` | 测试 | 2–14 |
+| `src/text2sql/metadata/structure.py` | 表族与公共列（纯函数） | 13 |
+| `src/text2sql/metadata/value_index.py` | 值索引选列规则、归一化、问题切词 | 14 |
+| `src/text2sql/metadata/collector/values.py` | 有界的 distinct 值采集 | 15 |
+| `src/text2sql/metadata/catalog/value_store.py` | 值索引构建的保存、保留 2 次、按租户精确 + 模糊检索 | 16 |
+| `src/text2sql/metadata/jobs.py`, `src/text2sql/jobs/worker.py` | `run_sync`、`run_value_index`、两个队列任务；worker 加载 handler 模块 | 17 |
+| `src/text2sql/metadata/__main__.py`, `src/text2sql/metadata/cli.py` | CLI（含 `structure`、`values`） | 18 |
+| `README.md`, `AGENTS.md` | 文档 | 19 |
+| `tests/unit/security/*`, `tests/unit/metadata/*`, `tests/integration/metadata/*`, `tests/unit/test_config.py`, `tests/integration/test_migrations.py` | 测试 | 2–18 |
 
-新表（迁移 0002）：`metadata_datasource`、`metadata_snapshot`、`metadata_table`、`metadata_column`、`metadata_index`、`metadata_foreign_key`、`metadata_view`、`metadata_object_identity`、`metadata_comment_review`、`metadata_release`、`metadata_release_pointer`、`metadata_release_event`、`metadata_stale_mark`；PG 函数 `metadata_snapshot_immutable()`、`metadata_release_components_immutable()`。
+新表（迁移 0002）：`metadata_datasource`、`metadata_snapshot`、`metadata_table`、`metadata_column`、`metadata_index`、`metadata_foreign_key`、`metadata_view`、`metadata_object_identity`、`metadata_comment_review`、`metadata_release`、`metadata_release_pointer`、`metadata_release_event`、`metadata_stale_mark`、`metadata_value_build`、`metadata_value_column`、`metadata_value`（共 16 张）；PG 扩展 `pg_trgm`；PG 函数 `metadata_snapshot_immutable()`、`metadata_release_components_immutable()`。
 
 ---
 
@@ -136,14 +145,14 @@
 | 4.4 | `SnapshotData 结构相同，但没有 snapshot_id 和 object_uuid（UUID 在保存时由 M4 分配）。` | `采集结果用不带 UUID 的 ColumnData / TableData（ColumnInfo、TableInfo 分别继承它们并加 object_uuid）；SnapshotData 含 datasource_id、database_name、server、collected_at、tables: tuple[TableData, ...]，没有 snapshot_id 和 content_hash（UUID 在保存时由 M4 分配，哈希由 snapshot_content_hash() 计算）。target_key() 对 5.7/8.0 以外的版本抛 METADATA_UNSUPPORTED_VERSION。` |
 | 4.6 `record_review` 下方 | — | 加一句：`同一对象同一注释哈希再次复核时覆盖旧决定（upsert）。` |
 | 4.7 `move_pointer` 说明 | `SELECT … FOR UPDATE 锁住指针行（不存在则插入）` | `先 SELECT … FOR UPDATE 锁住 metadata_datasource 行（指针行首次插入前也能让并发调用排队），再读取并更新或插入指针行` |
-| 4.9 队列段落末尾 | — | 追加：`worker 启动时导入 text2sql.jobs.worker.HANDLER_MODULES 中列出的模块完成 handler 注册（本 Spec 加入 text2sql.metadata.jobs）。` |
-| 新增 4.10 | — | 见下方代码块 |
+| 4.9 队列段落末尾 | — | 追加：`worker 启动时导入 text2sql.jobs.worker.HANDLER_MODULES 中列出的模块完成 handler 注册（本 Spec 加入 text2sql.metadata.jobs，它同时注册 metadata.sync 和 metadata.value_index）。` |
+| 新增 4.12 | — | 见下方代码块 |
 | 5 验收 2 | `…03 未就绪前使用测试内建的 3 张表夹具，…` | 在括号内追加：`夹具由 root 账号（T2S_TEST_MYSQL57_ADMIN_URL / T2S_TEST_MYSQL80_ADMIN_URL）在独立库 t2s_meta_fixture 中创建，并授予 t2s_ro SELECT；不改动 t2s_business` |
 
-新增小节（放在 4.9 之后、第 5 章之前）：
+新增小节（放在 4.11 M10 值索引之后、第 5 章之前；4.10、4.11 是 2026-11-22 修订加入的表族与值索引）：
 
 ```markdown
-### 4.10 错误码
+### 4.12 错误码
 
 | 错误码 | HTTP 状态（Spec 09 暴露接口时使用） | 场景 |
 | --- | --- | --- |
@@ -156,12 +165,15 @@
 | `RELEASE_INVALID` | 409 | release/快照不属于该数据源，或 release 已 `REJECTED` |
 | `RELEASE_GATE_REQUIRED` | 409 | `T2S_ENV=prod` 时调用不带门禁的激活 |
 | `STALE_MARK_NOT_FOUND` | 404 | 解决一个不存在或已解决的 STALE 标记 |
+| `VALUE_INDEX_NOT_FOUND` | 404 | 数据源还没有值索引构建（CLI `values show` / `values search`） |
 ```
+
+4.11 里 `run_value_index` 在数据源没有快照时抛 `METADATA_SNAPSHOT_NOT_FOUND`（不另设错误码）；值采集超时不是错误，记为该列的 `TIMEOUT` 跳过原因。
 
 - [ ] **Step 2: Check the spec renders**
 
-Run: `grep -n "collation_name\|最新一份\|4.10 错误码" docs/specs/02-metadata.md`
-Expected: 至少 6 行匹配。
+Run: `grep -n "collation_name\|最新一份\|4.12 错误码\|VALUE_INDEX_NOT_FOUND" docs/specs/02-metadata.md`
+Expected: 至少 7 行匹配。
 
 - [ ] **Step 3: Commit and push**
 
@@ -173,7 +185,7 @@ git push origin main
 
 ---
 
-### Task 2: `Settings.datasource_id`、元数据错误码、`.env.example`（spec 4.1、4.10）
+### Task 2: `Settings.datasource_id`、值索引配置、元数据错误码、`.env.example`（spec 4.1、4.12）
 
 **Files:**
 - Modify: `src/text2sql/common/config.py`, `src/text2sql/common/errors.py`, `.env.example`
@@ -183,7 +195,8 @@ git push origin main
 - Consumes: Spec 01 的 `Settings`、`get_settings()`、`AppError(code, message, status_code)`。
 - Produces:
   - `Settings.datasource_id: str`，默认 `"local"`，必须匹配 `^[a-z0-9_]{1,64}$`（环境变量 `T2S_DATASOURCE_ID`）。
-  - `text2sql.common.errors` 新常量：`METADATA_NO_DATABASE`、`METADATA_UNSUPPORTED_VERSION`、`METADATA_TOO_LARGE`、`METADATA_SNAPSHOT_NOT_FOUND`、`METADATA_OBJECT_NOT_FOUND`、`RELEASE_NOT_FOUND`、`RELEASE_INVALID`、`RELEASE_GATE_REQUIRED`、`STALE_MARK_NOT_FOUND`（值等于名字）。
+  - 值索引配置（spec 4.1 / 4.11）：`value_index_max_distinct: int = 5000`、`value_index_max_rows: int = 2_000_000`、`value_index_max_value_length: int = 128`、`value_index_timeout_ms: int = 3000`、`value_index_tenant_column: str = "tenant_id"`（空串 = 单租户库）。
+  - `text2sql.common.errors` 新常量：`METADATA_NO_DATABASE`、`METADATA_UNSUPPORTED_VERSION`、`METADATA_TOO_LARGE`、`METADATA_SNAPSHOT_NOT_FOUND`、`METADATA_OBJECT_NOT_FOUND`、`RELEASE_NOT_FOUND`、`RELEASE_INVALID`、`RELEASE_GATE_REQUIRED`、`STALE_MARK_NOT_FOUND`、`VALUE_INDEX_NOT_FOUND`（值等于名字）。
   - 没有新增 `lru_cache` 函数，所以 `tests/conftest.py` 的 `_CACHED_FUNCS` 不变。
 
 - [ ] **Step 1: Write the failing Settings tests**
@@ -203,12 +216,24 @@ def test_datasource_id_pattern_is_enforced(monkeypatch: pytest.MonkeyPatch, bad:
     monkeypatch.setenv("T2S_DATASOURCE_ID", bad)
     with pytest.raises(ValidationError):
         get_settings()
+
+
+def test_value_index_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    assert settings.value_index_max_distinct == 5000
+    assert settings.value_index_max_rows == 2_000_000
+    assert settings.value_index_max_value_length == 128
+    assert settings.value_index_timeout_ms == 3000
+    assert settings.value_index_tenant_column == "tenant_id"
+    get_settings.cache_clear()
+    monkeypatch.setenv("T2S_VALUE_INDEX_TENANT_COLUMN", "")
+    assert get_settings().value_index_tenant_column == ""
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/unit/test_config.py -v`
-Expected: `test_datasource_id_default_and_override` FAIL：`AttributeError: 'Settings' object has no attribute 'datasource_id'`；6 个参数化用例 FAIL：`Failed: DID NOT RAISE ValidationError`（`extra="ignore"` 把未知变量吞掉了）。
+Expected: `test_datasource_id_default_and_override` FAIL：`AttributeError: 'Settings' object has no attribute 'datasource_id'`；`test_value_index_defaults` FAIL：`AttributeError: … 'value_index_max_distinct'`；5 个参数化用例 FAIL：`Failed: DID NOT RAISE ValidationError`（`extra="ignore"` 把未知变量吞掉了）。
 
 - [ ] **Step 3: Modify `src/text2sql/common/config.py`**
 
@@ -218,14 +243,23 @@ Expected: `test_datasource_id_default_and_override` FAIL：`AttributeError: 'Set
 from pydantic import Field, SecretStr
 ```
 
-在 `job_lease_s: int = 300` 下面加两行：
+在 `job_lease_s: int = 300` 下面加：
 
 ```python
     # One process serves one business data source (Spec 02 4.1).
     datasource_id: str = Field(default="local", pattern=r"^[a-z0-9_]{1,64}$")
+    # Value index (Spec 02 M10): distinct values of low-cardinality text columns.
+    value_index_max_distinct: int = Field(default=5000, ge=1)
+    value_index_max_rows: int = Field(default=2_000_000, ge=1)
+    value_index_max_value_length: int = Field(default=128, ge=1, le=512)
+    # Must stay below business_db_timeout_s, the client read timeout.
+    value_index_timeout_ms: int = Field(default=3000, ge=100)
+    # Tables without this column are skipped so values never cross tenants.
+    # Empty string disables the check (single-tenant databases).
+    value_index_tenant_column: str = "tenant_id"
 ```
 
-`pattern` 由 pydantic 在读取环境变量时校验，不合法直接 `ValidationError`，进程起不来；比在采集时才发现要早。
+`pattern` 由 pydantic 在读取环境变量时校验，不合法直接 `ValidationError`，进程起不来；比在采集时才发现要早。值索引的配置都有默认值，`.env.example` 不用加；`value_index_timeout_ms` 是 MySQL 服务端的 `MAX_EXECUTION_TIME`，必须小于 Spec 01 的客户端读超时 `business_db_timeout_s`（5 s），否则客户端先断开，拿不到「超时」这个可识别的错误码。
 
 - [ ] **Step 4: Modify `src/text2sql/common/errors.py`**
 
@@ -242,9 +276,10 @@ RELEASE_NOT_FOUND = "RELEASE_NOT_FOUND"
 RELEASE_INVALID = "RELEASE_INVALID"
 RELEASE_GATE_REQUIRED = "RELEASE_GATE_REQUIRED"
 STALE_MARK_NOT_FOUND = "STALE_MARK_NOT_FOUND"
+VALUE_INDEX_NOT_FOUND = "VALUE_INDEX_NOT_FOUND"
 ```
 
-后续任务统一用 `AppError(<常量>, message, status_code)` 抛出，状态码见 spec 4.10。
+后续任务统一用 `AppError(<常量>, message, status_code)` 抛出，状态码见 spec 4.12。
 
 - [ ] **Step 5: Modify `.env.example`**
 
@@ -260,7 +295,7 @@ T2S_DATASOURCE_ID=local_mysql80
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/test_config.py -v`
-Expected: `13 passed`。
+Expected: `14 passed`。
 
 - [ ] **Step 7: Quality gates**
 
@@ -271,7 +306,7 @@ Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）
 
 ```bash
 git add src/text2sql/common/config.py src/text2sql/common/errors.py .env.example tests/unit/test_config.py
-git commit -m "feat(common): add datasource_id setting and metadata error codes"
+git commit -m "feat(common): add datasource_id and value index settings and metadata error codes"
 git push origin main
 ```
 
@@ -1919,7 +1954,7 @@ git push origin main
 
 ---
 
-### Task 7: 元数据表的 ORM 模型与迁移 `0002_metadata`（建表 + 不可变触发器，验收 1、4）
+### Task 7: 元数据表的 ORM 模型与迁移 `0002_metadata`（建表 + 不可变触发器 + `pg_trgm` 值索引表，验收 1、4）
 
 **Files:**
 - Create: `src/text2sql/metadata/catalog/__init__.py`, `src/text2sql/metadata/catalog/models.py`
@@ -1930,13 +1965,17 @@ git push origin main
 **Interfaces:**
 - Consumes: Spec 01 的 `Base`（命名约定 `pk_/uq_/fk_/ck_/ix_`）、`migrated_db` fixture、迁移 `0001`。
 - Produces:
-  - 13 个模型（`text2sql.metadata.catalog.models`）：`MetadataDatasource`、`MetadataSnapshot`、`MetadataTable`、`MetadataColumn`、`MetadataIndex`、`MetadataForeignKey`、`MetadataView`、`MetadataObjectIdentity`、`MetadataCommentReview`、`MetadataRelease`、`MetadataReleasePointer`、`MetadataReleaseEvent`、`MetadataStaleMark`；常量 `SNAPSHOT_TABLES`（6 张不可变表）。
+  - 16 个模型（`text2sql.metadata.catalog.models`）：`MetadataDatasource`、`MetadataSnapshot`、`MetadataTable`、`MetadataColumn`、`MetadataIndex`、`MetadataForeignKey`、`MetadataView`、`MetadataObjectIdentity`、`MetadataCommentReview`、`MetadataRelease`、`MetadataReleasePointer`、`MetadataReleaseEvent`、`MetadataStaleMark`，以及值索引（spec 4.11）的 `MetadataValueBuild`、`MetadataValueColumn`、`MetadataValue`；常量 `SNAPSHOT_TABLES`（6 张不可变表）。
+  - 值索引表可变（重建时整批替换、只保留最近 2 次构建），不挂不可变触发器；`metadata_value.value_norm` 上有 GIN 索引 `ix_metadata_value_norm_trgm`（`gin_trgm_ops`），`(build_id, value_norm)` 上有 B-tree `ix_metadata_value_build_norm` 供精确匹配。
+  - 迁移第一句 `CREATE EXTENSION IF NOT EXISTS pg_trgm`（PG 13 起是 trusted extension，库 owner 可装；downgrade 不卸载）。
   - 列名 `collation_name`（不是 `collation`，见待确认 2）。
   - PG 函数 `metadata_snapshot_immutable()`（6 张快照表的 `BEFORE UPDATE OR DELETE` 触发器，报错 `snapshot rows are immutable`）、`metadata_release_components_immutable()`（`metadata_release` 的 `BEFORE UPDATE`，只允许改 `status`、`evaluation_status`、`eval_run_id`、`note`，报错 `release components are immutable`）。
   - 部分唯一索引 `uq_metadata_object_identity_active`（`WHERE retired_at_snapshot_id IS NULL`）、`uq_metadata_stale_mark_open`（`WHERE resolved_at IS NULL`）；`metadata_snapshot` 上是普通索引 `ix_metadata_snapshot_datasource_hash`（见待确认 1）。
   - fixture `metadata_db`（在 `migrated_db` 之上，前后 `TRUNCATE` 全部元数据表）。
 
-迁移是用 `uv run alembic revision --autogenerate -m metadata --rev-id 0002` 生成后整理的（去掉注释、加触发器），下面给出整理后的完整文件，直接创建即可，不需要再跑 autogenerate。
+迁移是用 `uv run alembic revision --autogenerate -m metadata --rev-id 0002` 生成后整理的（去掉注释、加触发器、在最前面加 `CREATE EXTENSION IF NOT EXISTS pg_trgm`），下面给出整理后的完整文件，直接创建即可，不需要再跑 autogenerate。
+
+为什么值索引表也放进 0002 而不是单独一个迁移：AGENTS.md 约定迁移前缀等于 spec 编号，值索引属于 Spec 02。`pg_trgm` 是 PostgreSQL contrib 自带扩展，Compose 用的 `pgvector/pgvector:pg16` 镜像基于官方 `postgres:16`，已包含；写计划时在你的 Compose PG 上以 `t2s` 执行 `CREATE EXTENSION pg_trgm` 成功，`word_similarity('华东精密', '华东精密有限公司') = 0.8`，中文可用。GIN 索引的 `postgresql_ops={"value_norm": "gin_trgm_ops"}` 同时写在模型上，`compare_metadata` 才不会报差异。
 
 `collation` 是 PostgreSQL 保留字：不加引号写 `CREATE TABLE … (collation VARCHAR(64))` 会报 `syntax error at or near "collation"`（写计划时实测过），所以三张表的列名用 `collation_name`。
 
@@ -1944,7 +1983,7 @@ git push origin main
 
 - [ ] **Step 1: Modify `tests/integration/test_migrations.py`**
 
-1. 导入区加 `from text2sql.metadata.catalog.models import SNAPSHOT_TABLES`（放在 `from text2sql.db.system import get_engine` 后面）。
+1. 导入区：`from sqlalchemy import inspect` 改为 `from sqlalchemy import inspect, text`；加 `from text2sql.metadata.catalog.models import SNAPSHOT_TABLES`（放在 `from text2sql.db.system import get_engine` 后面）。
 2. `pytestmark = ...` 下面加：
 
 ```python
@@ -1957,13 +1996,18 @@ METADATA_TABLES = {
     "metadata_release_pointer",
     "metadata_release_event",
     "metadata_stale_mark",
+    "metadata_value_build",
+    "metadata_value_column",
+    "metadata_value",
 }
 ```
 
-3. 在 `assert "jobs" in inspector.get_table_names()` 后面加：
+3. 在 `assert "jobs" in inspector.get_table_names()` 后面加（第二条断言保证迁移装好了 `pg_trgm`）：
 
 ```python
         assert set(inspector.get_table_names()) >= METADATA_TABLES
+        with engine.connect() as conn:
+            assert conn.scalar(text("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")) == 1
 ```
 
 4. 在 `command.downgrade(alembic_cfg, "base")` **前面**加（验收 1：能回滚到 0001）：
@@ -1997,6 +2041,9 @@ METADATA_TABLES = (
     "metadata_release_pointer",
     "metadata_release_event",
     "metadata_stale_mark",
+    "metadata_value_build",
+    "metadata_value_column",
+    "metadata_value",
 )
 ```
 
@@ -2126,7 +2173,7 @@ Create empty files: `src/text2sql/metadata/catalog/__init__.py`.
 Create `src/text2sql/metadata/catalog/models.py`:
 
 ```python
-"""SQLAlchemy models for the metadata catalog (Spec 02 4.3, 4.5-4.8).
+"""SQLAlchemy models for the metadata catalog (Spec 02 4.3, 4.5-4.8, 4.11).
 
 The tables are created by migration `0002_metadata`; `tests/integration/test_migrations.py`
 checks that this module and the migration stay identical.
@@ -2478,6 +2525,67 @@ class MetadataStaleMark(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_by: Mapped[str | None] = mapped_column(String(128))
     resolution_note: Mapped[str | None] = mapped_column(Text)
+
+
+class MetadataValueBuild(Base):
+    """One value-index build (Spec 02 4.11). Rebuilt, not immutable; old builds are pruned."""
+
+    __tablename__ = "metadata_value_build"
+    __table_args__ = (Index("ix_metadata_value_build_datasource", "datasource_id", "id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    datasource_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("metadata_datasource.datasource_id"), nullable=False
+    )
+    snapshot_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("metadata_snapshot.id"), nullable=False
+    )
+    indexed_column_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_column_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    value_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class MetadataValueColumn(Base):
+    """Every text column considered by a build, indexed or skipped with a reason."""
+
+    __tablename__ = "metadata_value_column"
+    __table_args__ = (UniqueConstraint("build_id", "column_key"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    build_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("metadata_value_build.id", ondelete="CASCADE"), nullable=False
+    )
+    column_key: Mapped[str] = mapped_column(String(300), nullable=False)
+    skip_reason: Mapped[str | None] = mapped_column(String(32))
+    value_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class MetadataValue(Base):
+    __tablename__ = "metadata_value"
+    __table_args__ = (
+        Index("ix_metadata_value_build_norm", "build_id", "value_norm"),
+        # pg_trgm GIN index: similarity (%) and word similarity (<%) lookups.
+        Index(
+            "ix_metadata_value_norm_trgm",
+            "value_norm",
+            postgresql_using="gin",
+            postgresql_ops={"value_norm": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    build_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("metadata_value_build.id", ondelete="CASCADE"), nullable=False
+    )
+    column_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("metadata_value_column.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_key: Mapped[str | None] = mapped_column(String(64))
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_norm: Mapped[str] = mapped_column(Text, nullable=False)
 ```
 
 - [ ] **Step 7: Modify `migrations/env.py`**
@@ -2507,7 +2615,7 @@ from text2sql.db.models import Base
 Create `migrations/versions/0002_metadata.py`:
 
 ```python
-"""metadata catalog: snapshots, identities, comment reviews, releases, stale marks
+"""metadata catalog: snapshots, identities, comment reviews, releases, stale marks, value index
 
 Revision ID: 0002
 Revises: 0001
@@ -2571,6 +2679,9 @@ $$
 
 
 def upgrade() -> None:
+    # Value index similarity search (Spec 02 4.11). pg_trgm is a trusted extension
+    # since PostgreSQL 13: the database owner can create it without superuser.
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     op.create_table(
         "metadata_datasource",
         sa.Column("datasource_id", sa.String(length=64), nullable=False),
@@ -2993,6 +3104,92 @@ def upgrade() -> None:
         sa.UniqueConstraint("table_id", name=op.f("uq_metadata_view_table_id")),
     )
 
+    op.create_table(
+        "metadata_value_build",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=False), nullable=False),
+        sa.Column("datasource_id", sa.String(length=64), nullable=False),
+        sa.Column("snapshot_id", sa.BigInteger(), nullable=False),
+        sa.Column("indexed_column_count", sa.Integer(), nullable=False),
+        sa.Column("skipped_column_count", sa.Integer(), nullable=False),
+        sa.Column("value_count", sa.Integer(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column("created_by", sa.String(length=128), nullable=False),
+        sa.Column("trace_id", sa.String(length=64), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["datasource_id"],
+            ["metadata_datasource.datasource_id"],
+            name=op.f("fk_metadata_value_build_datasource_id_metadata_datasource"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["snapshot_id"],
+            ["metadata_snapshot.id"],
+            name=op.f("fk_metadata_value_build_snapshot_id_metadata_snapshot"),
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_metadata_value_build")),
+    )
+    op.create_index(
+        "ix_metadata_value_build_datasource",
+        "metadata_value_build",
+        ["datasource_id", "id"],
+        unique=False,
+    )
+    op.create_table(
+        "metadata_value_column",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=False), nullable=False),
+        sa.Column("build_id", sa.BigInteger(), nullable=False),
+        sa.Column("column_key", sa.String(length=300), nullable=False),
+        sa.Column("skip_reason", sa.String(length=32), nullable=True),
+        sa.Column("value_count", sa.Integer(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["build_id"],
+            ["metadata_value_build.id"],
+            name=op.f("fk_metadata_value_column_build_id_metadata_value_build"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_metadata_value_column")),
+        sa.UniqueConstraint(
+            "build_id", "column_key", name=op.f("uq_metadata_value_column_build_id")
+        ),
+    )
+    op.create_table(
+        "metadata_value",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=False), nullable=False),
+        sa.Column("build_id", sa.BigInteger(), nullable=False),
+        sa.Column("column_id", sa.BigInteger(), nullable=False),
+        sa.Column("tenant_key", sa.String(length=64), nullable=True),
+        sa.Column("value", sa.Text(), nullable=False),
+        sa.Column("value_norm", sa.Text(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["build_id"],
+            ["metadata_value_build.id"],
+            name=op.f("fk_metadata_value_build_id_metadata_value_build"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["column_id"],
+            ["metadata_value_column.id"],
+            name=op.f("fk_metadata_value_column_id_metadata_value_column"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_metadata_value")),
+    )
+    op.create_index(
+        "ix_metadata_value_build_norm", "metadata_value", ["build_id", "value_norm"], unique=False
+    )
+    op.create_index(
+        "ix_metadata_value_norm_trgm",
+        "metadata_value",
+        ["value_norm"],
+        unique=False,
+        postgresql_using="gin",
+        postgresql_ops={"value_norm": "gin_trgm_ops"},
+    )
+
     op.execute(SNAPSHOT_IMMUTABLE_FUNCTION)
     for table in SNAPSHOT_TABLES:
         op.execute(
@@ -3007,6 +3204,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("ix_metadata_value_norm_trgm", table_name="metadata_value")
+    op.drop_index("ix_metadata_value_build_norm", table_name="metadata_value")
+    op.drop_table("metadata_value")
+    op.drop_table("metadata_value_column")
+    op.drop_index("ix_metadata_value_build_datasource", table_name="metadata_value_build")
+    op.drop_table("metadata_value_build")
     op.drop_table("metadata_view")
     op.drop_table("metadata_release_pointer")
     op.drop_table("metadata_release_event")
@@ -3033,6 +3236,7 @@ def downgrade() -> None:
     op.drop_table("metadata_datasource")
     op.execute("DROP FUNCTION metadata_release_components_immutable()")
     op.execute("DROP FUNCTION metadata_snapshot_immutable()")
+    # pg_trgm stays installed: other objects may use it, and upgrade uses IF NOT EXISTS.
 ```
 
 - [ ] **Step 9: Run tests to verify they pass**
@@ -3043,7 +3247,7 @@ Expected: `7 passed`（迁移 1 个 + 触发器 6 个）。
 - [ ] **Step 10: Check upgrade/downgrade by hand (acceptance 1)**
 
 Run: `uv run alembic downgrade 0001 && uv run alembic upgrade head && docker compose -f deployment/compose.yaml exec pg psql -U t2s -d t2s_system -c '\dt metadata_*'`
-Expected: 两条 alembic 命令退出码 0；`\dt` 列出 13 张 `metadata_*` 表。
+Expected: 两条 alembic 命令退出码 0；`\dt` 列出 16 张 `metadata_*` 表。
 
 - [ ] **Step 11: Quality gates**
 
@@ -3054,7 +3258,7 @@ Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）
 
 ```bash
 git add src/text2sql/metadata/catalog migrations/env.py migrations/versions/0002_metadata.py tests/integration/test_migrations.py tests/integration/metadata/conftest.py tests/integration/metadata/test_catalog_triggers.py
-git commit -m "feat(metadata): add catalog tables, immutability triggers and migration 0002"
+git commit -m "feat(metadata): add catalog and value index tables, triggers and migration 0002"
 git push origin main
 ```
 
@@ -3810,7 +4014,7 @@ git push origin main
 - Produces（`text2sql.metadata.comment_review`）:
   - `Decision = Literal["ALLOW", "REDACT"]`、`comment_hash(comment: str) -> str`（sha256 原文）
   - `record_review(session, *, datasource_id, object_type, object_key, comment, decision, reviewer, note="") -> None`（同一哈希重复复核时覆盖，待确认 8）
-  - `review_decision(session, *, datasource_id, object_type, object_key, comment) -> Decision | None`（Task 14 的 `flagged` 用它找「未复核」）
+  - `review_decision(session, *, datasource_id, object_type, object_key, comment) -> Decision | None`（Task 18 的 `flagged` 用它找「未复核」）
   - `comment_visible(session, *, datasource_id, object_type, object_key, comment, flags) -> bool`
 
 - [ ] **Step 1: Write the failing tests**
@@ -4655,7 +4859,1319 @@ git push origin main
 
 ---
 
-### Task 13: 同步服务与队列任务 `metadata.sync`（M8 队列部分，验收 2、3、5、6 端到端）
+### Task 13: 表族与公共列 `structure.py`（M9、spec 4.10，验收 13）
+
+**Files:**
+- Create: `src/text2sql/metadata/structure.py`
+- Test: `tests/unit/metadata/test_structure.py`
+
+**Interfaces:**
+- Consumes: Task 4 的 `TableData`；`tests/metadata_factories.py` 的 `make_table()`、`make_column()`。
+- Produces（`text2sql.metadata.structure`，纯函数，不读库、不存储、不进 `content_hash`）:
+  - `family_stem(table_name) -> str`：去掉一个或多个分表/备份后缀（`_数字`、`_bak`、`_old`、`_his`、`_archive` 等），小写。
+  - `TableFamily(stem, representative, members)`；`table_families(tables) -> tuple[TableFamily, ...]`：同词干且「列名 + 类型」序列完全相同的 ≥ 2 张基表成为一个表族；代表表优先取不带后缀的那张，否则取名字最大的（通常是最新分表）。视图不参与。
+  - `common_columns(tables, *, min_tables=5, ratio=0.5) -> tuple[str, ...]`：在至少 5 张、且至少一半基表里以同名同类型出现的列（主键列除外），如 `created_at`、`tenant_id`。
+  - `StructureSummary(families, common_columns)`（方法 `family_of(table)`）；`summarize_structure(tables)`。
+  - 常量 `MIN_COMMON_TABLES = 5`、`COMMON_TABLE_RATIO = 0.5`。
+
+为什么在元数据层做：分表、年表、备份表和审计列是大 schema 上下文膨胀的主要来源。ReFoRCE 把同构表折叠成一组、DBCC 把重复的审计列抽出来只列一次，都报告了明显的上下文压缩；业界（supersonic、WrenAI）也是在建模层而不是在 prompt 里处理分表。这里只产出结构事实，怎么用由 Spec 08 A3（摘要折叠）和 Spec 03 E10（干扰表）决定。
+
+判断表族同时要求「词干相同」和「列签名相同」：只按名字会把 `t_order` 和 `t_order_item` 之外的 `t_order_01`（结构不同的历史表）误折叠；只按结构会把恰好同构的两张业务表（如 `t_tag` / `t_label`）合并。
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/unit/metadata/test_structure.py`:
+
+```python
+import pytest
+
+from tests.metadata_factories import make_column, make_table
+from text2sql.metadata.snapshot import ColumnData, TableData
+from text2sql.metadata.structure import (
+    common_columns,
+    family_stem,
+    summarize_structure,
+    table_families,
+)
+
+
+def _columns(*extra: str) -> tuple[ColumnData, ...]:
+    names = ("id", "status", *extra)
+    return tuple(
+        make_column(name, position, is_primary=name == "id")
+        for position, name in enumerate(names, start=1)
+    )
+
+
+def _audited(name: str, *extra: str) -> TableData:
+    return make_table(name, _columns("tenant_id", "created_at", "is_deleted", *extra))
+
+
+@pytest.mark.parametrize(
+    ("name", "stem"),
+    [
+        ("t_order_202401", "t_order"),
+        ("t_order_2024_01", "t_order"),
+        ("t_order_01", "t_order"),
+        ("t_order_bak", "t_order"),
+        ("T_Order_HIS", "t_order"),
+        ("t_work_order", "t_work_order"),
+        ("t_order_items", "t_order_items"),
+    ],
+)
+def test_family_stem(name: str, stem: str) -> None:
+    assert family_stem(name) == stem
+
+
+def test_identical_shards_form_one_family_with_the_plain_table_as_representative() -> None:
+    tables = (
+        make_table("t_order", _columns()),
+        make_table("t_order_2023", _columns()),
+        make_table("t_order_bak", _columns()),
+        make_table("t_customer", _columns()),
+    )
+    (family,) = table_families(tables)
+    assert family.stem == "t_order"
+    assert family.representative == "t_order"
+    assert family.members == ("t_order", "t_order_2023", "t_order_bak")
+
+
+def test_without_a_plain_table_the_last_shard_represents_the_family() -> None:
+    tables = (make_table("t_log_202401", _columns()), make_table("t_log_202402", _columns()))
+    (family,) = table_families(tables)
+    assert family.representative == "t_log_202402"
+
+
+def test_tables_with_different_columns_or_views_are_not_folded() -> None:
+    tables = (
+        make_table("t_order", _columns()),
+        make_table("t_order_bak", _columns("extra")),
+        make_table("t_order_2023", _columns(), table_type="VIEW"),
+    )
+    assert table_families(tables) == ()
+
+
+def test_common_columns_need_enough_tables_and_exclude_primary_keys() -> None:
+    tables = tuple(_audited(f"t_{i}") for i in range(6)) + (
+        make_table("t_plain_a", _columns()),
+        make_table("t_plain_b", _columns()),
+    )
+    # 6 of 8 base tables (75%) have the audit columns; `id` and `status` are on
+    # all 8 but `id` is a primary key.
+    assert common_columns(tables) == ("created_at", "is_deleted", "status", "tenant_id")
+
+
+def test_common_columns_respect_the_absolute_minimum() -> None:
+    tables = tuple(_audited(f"t_{i}") for i in range(4))
+    assert common_columns(tables) == ()
+    assert common_columns(tables, min_tables=3) == (
+        "created_at",
+        "is_deleted",
+        "status",
+        "tenant_id",
+    )
+
+
+def test_summary_looks_up_families() -> None:
+    summary = summarize_structure(
+        (make_table("t_order", _columns()), make_table("t_order_bak", _columns()))
+    )
+    family = summary.family_of("t_order_bak")
+    assert family is not None
+    assert family.representative == "t_order"
+    assert summary.family_of("t_customer") is None
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/unit/metadata/test_structure.py -v`
+Expected: collection ERROR：`ModuleNotFoundError: No module named 'text2sql.metadata.structure'`。
+
+- [ ] **Step 3: Implement table families and common columns**
+
+Create `src/text2sql/metadata/structure.py`:
+
+```python
+"""Table families and common columns derived from a snapshot (Spec 02 M9).
+
+Pure functions over the collected structure: no data access, nothing stored,
+nothing added to the content hash. Specs 03 and 08 use the result to fold
+isomorphic tables (shards, backups, yearly copies) into one entry and to list
+repeated audit columns once instead of once per table, the two compressions
+that ReFoRCE (table grouping) and DBCC (audit-column extraction) report as the
+biggest context savings on enterprise schemas.
+"""
+
+import math
+import re
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from text2sql.metadata.snapshot import TableData
+
+# One or more trailing suffixes that mark a copy or shard of one logical table:
+# t_order_202401, t_order_2024_01, t_order_01, t_order_bak, t_order_his ...
+_FAMILY_SUFFIX = re.compile(
+    r"^(?P<stem>.+?)(?:_(?:\d{1,8}|bak|backup|old|tmp|temp|copy|his|history|archive|arch))+$",
+    re.IGNORECASE,
+)
+
+# A column is "common" when at least this many base tables, and at least this
+# share of all base tables, have a column with the same name and data type.
+MIN_COMMON_TABLES = 5
+COMMON_TABLE_RATIO = 0.5
+
+
+@dataclass(frozen=True)
+class TableFamily:
+    stem: str
+    representative: str
+    members: tuple[str, ...]  # sorted by name, includes the representative
+
+
+@dataclass(frozen=True)
+class StructureSummary:
+    families: tuple[TableFamily, ...]
+    common_columns: tuple[str, ...]
+
+    def family_of(self, table: str) -> TableFamily | None:
+        for family in self.families:
+            if table in family.members:
+                return family
+        return None
+
+
+def family_stem(table_name: str) -> str:
+    """`t_order_2024_01` -> `t_order`; names without a family suffix are their own stem."""
+    match = _FAMILY_SUFFIX.match(table_name)
+    return (match.group("stem") if match else table_name).lower()
+
+
+def _signature(table: TableData) -> tuple[tuple[str, str], ...]:
+    ordered = sorted(table.columns, key=lambda c: c.ordinal_position)
+    return tuple((c.name.lower(), c.data_type) for c in ordered)
+
+
+def table_families(tables: Sequence[TableData]) -> tuple[TableFamily, ...]:
+    """Group base tables with the same stem and exactly the same columns.
+
+    Requiring identical columns (name and type, in order) means two tables are
+    never folded together unless one could stand in for the other.
+    """
+    groups: dict[tuple[str, tuple[tuple[str, str], ...]], list[str]] = defaultdict(list)
+    for table in tables:
+        if table.table_type == "BASE TABLE":
+            groups[(family_stem(table.name), _signature(table))].append(table.name)
+    families = []
+    for (stem, _), names in groups.items():
+        if len(names) < 2:
+            continue
+        names.sort()
+        plain = [name for name in names if name.lower() == stem]
+        # Prefer the table without a suffix; otherwise the last shard by name.
+        representative = plain[0] if plain else names[-1]
+        families.append(TableFamily(stem=stem, representative=representative, members=tuple(names)))
+    return tuple(sorted(families, key=lambda f: f.stem))
+
+
+def common_columns(
+    tables: Sequence[TableData],
+    *,
+    min_tables: int = MIN_COMMON_TABLES,
+    ratio: float = COMMON_TABLE_RATIO,
+) -> tuple[str, ...]:
+    """Column names repeated across most base tables (audit, soft-delete, tenant columns).
+
+    Primary-key columns are never common: they identify rows and must stay in
+    every table's own description.
+    """
+    base = [t for t in tables if t.table_type == "BASE TABLE"]
+    threshold = max(min_tables, math.ceil(ratio * len(base)))
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    primary: set[str] = set()
+    for table in base:
+        for column in table.columns:
+            counts[(column.name.lower(), column.data_type)] += 1
+            if column.is_primary:
+                primary.add(column.name.lower())
+    names = {name for (name, _), count in counts.items() if count >= threshold}
+    return tuple(sorted(names - primary))
+
+
+def summarize_structure(tables: Sequence[TableData]) -> StructureSummary:
+    return StructureSummary(families=table_families(tables), common_columns=common_columns(tables))
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest tests/unit/metadata/test_structure.py -v`
+Expected: `13 passed`。
+
+- [ ] **Step 5: Quality gates**
+
+Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
+Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add src/text2sql/metadata/structure.py tests/unit/metadata/test_structure.py
+git commit -m "feat(metadata): derive table families and common columns from snapshots"
+git push origin main
+```
+
+---
+
+### Task 14: 值索引规则 `value_index.py`：选列、归一化、问题切词（M10、spec 4.11，验收 14）
+
+**Files:**
+- Create: `src/text2sql/metadata/value_index.py`
+- Test: `tests/unit/metadata/test_value_index.py`
+
+**Interfaces:**
+- Consumes: Task 4 的 `ColumnData`、`TableData`；`tests/metadata_factories.py`。
+- Produces（`text2sql.metadata.value_index`，纯函数）:
+  - `SkipReason = Literal["VIEW", "TOO_MANY_ROWS", "NO_TENANT_KEY", "TYPE_TOO_LONG", "KEY_COLUMN", "NAME_PATTERN", "SENSITIVE_HINT", "EXCLUDED", "TOO_MANY_VALUES", "TIMEOUT"]`（与 spec 4.11 跳过原因表一致；后两个由 Task 15 的采集器给出）。
+  - `ColumnDecision(table, column, tenant_column, skip_reason)`，属性 `key`（`"表.列"`）、`eligible`。
+  - `plan_value_columns(tables, *, tenant_column: str | None, max_rows: int, include=(), exclude=()) -> list[ColumnDecision]`：每个文本列（`char`/`varchar`/`enum`/`*text`）一条决定。优先级：`EXCLUDED` > 表级（`VIEW`、`TOO_MANY_ROWS`、`NO_TENANT_KEY`）> `KEY_COLUMN`（主键、唯一、外键、租户列）> `include` 可解除的软规则（`TYPE_TOO_LONG`、`NAME_PATTERN`、`SENSITIVE_HINT`）。
+  - `normalize_value(value) -> str`：NFKC + casefold + 折叠空白。
+  - `QueryTerms(grams, spans)`；`query_terms(text, *, min_len=2, max_len=16, max_grams=2000)`：每个词串的全部 2–16 字子串（长的在前）作精确匹配候选，整段词串作模糊匹配候选。
+
+选列规则参考 CHESS 的预处理（跳过 id、url、email、电话、地址类列，只留短文本列）和 supersonic 的维度值词典（只收低基数维度列）；另加两条自己的规则：注释像敏感信息的列跳过（`SENSITIVE_HINT`，中文提示词），多租户库里没有租户列的表整表跳过（`NO_TENANT_KEY`）——值索引是业务数据在 PG 里的副本，不受业务库的租户隔离保护，宁可漏收也不能串租户（spec 4.11、架构 11.1）。
+
+`query_terms` 不用中文分词器：问题里逐字出现的值（「华东区」「微信」）一定是某个子串，精确匹配用 `value_norm IN (…)` 一次查完；变体（「华东精密」对「华东精密有限公司」）交给 Task 16 的 `pg_trgm` 模糊匹配。`max_grams` 防止超长问题生成过多候选。
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/unit/metadata/test_value_index.py`:
+
+```python
+from tests.metadata_factories import make_column, make_table
+from text2sql.metadata.snapshot import ColumnData, ForeignKeyInfo, TableData
+from text2sql.metadata.value_index import normalize_value, plan_value_columns, query_terms
+
+
+def _text(name: str, position: int, length: int = 32, **overrides: object) -> ColumnData:
+    values: dict[str, object] = {
+        "data_type": "varchar",
+        "column_type": f"varchar({length})",
+        "character_set": "utf8mb4",
+        "collation": "utf8mb4_general_ci",
+    }
+    values.update(overrides)
+    return make_column(name, position, **values)
+
+
+def _customer(**overrides: object) -> TableData:
+    columns = (
+        make_column("id", 1, is_primary=True, is_unique=True),
+        make_column("tenant_id", 2),
+        _text("region", 3, comment="所属大区"),
+        _text("customer_name", 4, 64, comment="客户名称"),
+        _text("customer_code", 5),
+        _text("contact_name", 6, comment="联系人姓名"),
+        _text("remark", 7, 500),
+        _text("level", 8, data_type="enum", column_type="enum('A','B','C')"),
+        _text("profile", 9, data_type="text", column_type="text"),
+        _text("parent_ref", 10),
+        _text("serial", 11, is_unique=True),
+    )
+    fk = ForeignKeyInfo(
+        name="fk_parent",
+        columns=("parent_ref",),
+        ref_table="t_parent",
+        ref_columns=("ref",),
+        on_update="",
+        on_delete="",
+    )
+    values: dict[str, object] = {"foreign_keys": (fk,), "row_estimate": 1000}
+    values.update(overrides)
+    return make_table("t_customer", columns, **values)
+
+
+def _reasons(tables: tuple[TableData, ...], **kwargs: object) -> dict[str, str | None]:
+    options: dict[str, object] = {"tenant_column": "tenant_id", "max_rows": 1_000_000}
+    options.update(kwargs)
+    decisions = plan_value_columns(tables, **options)  # type: ignore[arg-type]
+    return {d.key: d.skip_reason for d in decisions}
+
+
+def test_rules_per_column() -> None:
+    assert _reasons((_customer(),)) == {
+        "t_customer.region": None,
+        "t_customer.customer_name": None,
+        "t_customer.customer_code": "NAME_PATTERN",
+        "t_customer.contact_name": "SENSITIVE_HINT",
+        "t_customer.remark": "TYPE_TOO_LONG",
+        "t_customer.level": None,
+        "t_customer.profile": "TYPE_TOO_LONG",
+        "t_customer.parent_ref": "KEY_COLUMN",
+        "t_customer.serial": "KEY_COLUMN",
+    }
+
+
+def test_decisions_carry_the_tenant_column() -> None:
+    (first, *_) = plan_value_columns((_customer(),), tenant_column="TENANT_ID", max_rows=10**6)
+    assert first.tenant_column == "tenant_id"
+    assert first.eligible
+
+
+def test_table_level_reasons() -> None:
+    no_tenant = make_table("t_tag", (make_column("id", 1, is_primary=True), _text("tag", 2)))
+    view = make_table("v_customer", (_text("region", 1),), table_type="VIEW")
+    assert _reasons((no_tenant, view)) == {
+        "t_tag.tag": "NO_TENANT_KEY",
+        "v_customer.region": "VIEW",
+    }
+    assert _reasons((no_tenant,), tenant_column=None) == {"t_tag.tag": None}
+    assert set(_reasons((_customer(row_estimate=5_000_000),)).values()) == {"TOO_MANY_ROWS"}
+
+
+def test_include_lifts_soft_rules_and_exclude_always_wins() -> None:
+    reasons = _reasons(
+        (_customer(),),
+        include={"t_customer.contact_name", "t_customer.customer_code", "t_customer.serial"},
+        exclude={"t_customer.region"},
+    )
+    assert reasons["t_customer.contact_name"] is None
+    assert reasons["t_customer.customer_code"] is None
+    assert reasons["t_customer.serial"] == "KEY_COLUMN"
+    assert reasons["t_customer.region"] == "EXCLUDED"
+
+
+def test_normalize_value() -> None:
+    assert normalize_value("  ＷeChat \t 支付 ") == "wechat 支付"
+    assert normalize_value("华东区") == "华东区"
+
+
+def test_query_terms_cover_every_substring_longest_first() -> None:
+    terms = query_terms("华东区，上月 WeChat")
+    assert terms.spans == ("华东区", "上月", "wechat")
+    assert terms.grams[0] == "wechat"
+    assert {"华东区", "华东", "东区", "上月", "chat"} <= set(terms.grams)
+    assert "华" not in terms.grams
+
+
+def test_query_terms_are_capped() -> None:
+    assert len(query_terms("一二三四五六七八九十" * 20, max_grams=50).grams) == 50
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/unit/metadata/test_value_index.py -v`
+Expected: collection ERROR：`ModuleNotFoundError: No module named 'text2sql.metadata.value_index'`。
+
+- [ ] **Step 3: Implement the column rules and query terms**
+
+Create `src/text2sql/metadata/value_index.py`:
+
+```python
+"""Value index rules (Spec 02 M10): which columns to index and how values are matched.
+
+Pure functions only. The collector (`collector/values.py`) reads the values,
+`catalog/value_store.py` stores and searches them. The column rules follow the
+CHESS preprocessing idea (skip ids, urls, emails, phones, addresses; keep
+short text columns) plus two rules of our own: sensitive-looking comments are
+skipped, and in multi-tenant databases every value keeps its tenant key.
+"""
+
+import re
+import unicodedata
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
+from typing import Literal
+
+from text2sql.metadata.snapshot import ColumnData, TableData
+
+SkipReason = Literal[
+    "VIEW",
+    "TOO_MANY_ROWS",
+    "NO_TENANT_KEY",
+    "TYPE_TOO_LONG",
+    "KEY_COLUMN",
+    "NAME_PATTERN",
+    "SENSITIVE_HINT",
+    "EXCLUDED",
+    "TOO_MANY_VALUES",
+    "TIMEOUT",
+]
+
+SHORT_TEXT_TYPES = frozenset({"char", "varchar", "enum"})
+LONG_TEXT_TYPES = frozenset({"tinytext", "text", "mediumtext", "longtext"})
+MAX_DECLARED_LENGTH = 255
+
+_LENGTH = re.compile(r"\((\d+)\)")
+_NAME_SKIP = re.compile(
+    r"(^|_)(id|ids|uuid|guid|no|num|code|key|token|secret|password|passwd|pwd|hash|salt|"
+    r"sign|url|uri|link|path|email|mail|phone|mobile|tel|fax|address|addr|ip|mac|"
+    r"idcard|card|bank|account)$"
+)
+_SENSITIVE_HINTS = ("手机", "电话", "邮箱", "地址", "身份证", "证件", "姓名", "密码", "银行卡")
+_WORD = re.compile(r"\w+")
+
+
+@dataclass(frozen=True)
+class ColumnDecision:
+    table: str
+    column: str
+    tenant_column: str | None  # actual tenant column name in this table, if any
+    skip_reason: SkipReason | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.table}.{self.column}"
+
+    @property
+    def eligible(self) -> bool:
+        return self.skip_reason is None
+
+
+def _declared_length(column: ColumnData) -> int | None:
+    match = _LENGTH.search(column.column_type)
+    return int(match.group(1)) if match else None
+
+
+def _column_reason(
+    column: ColumnData, key_columns: set[str], *, included: bool
+) -> SkipReason | None:
+    name = column.name.lower()
+    if column.is_primary or column.is_unique or name in key_columns:
+        return "KEY_COLUMN"
+    if included:
+        return None
+    if column.data_type in LONG_TEXT_TYPES:
+        return "TYPE_TOO_LONG"
+    length = _declared_length(column)
+    if column.data_type != "enum" and length is not None and length > MAX_DECLARED_LENGTH:
+        return "TYPE_TOO_LONG"
+    if _NAME_SKIP.search(name):
+        return "NAME_PATTERN"
+    if any(hint in column.comment for hint in _SENSITIVE_HINTS):
+        return "SENSITIVE_HINT"
+    return None
+
+
+def plan_value_columns(
+    tables: Sequence[TableData],
+    *,
+    tenant_column: str | None,
+    max_rows: int,
+    include: Collection[str] = (),
+    exclude: Collection[str] = (),
+) -> list[ColumnDecision]:
+    """One decision per text column (char/varchar/enum/text types), in snapshot order.
+
+    `include` / `exclude` hold `table.column` keys (Spec 05 `columns.yaml`
+    `value_index` later feeds them). `exclude` always wins; `include` only lifts
+    the length, name and comment rules: key columns, views, row limits and the
+    tenant rule still apply.
+    """
+    tenant = tenant_column.lower() if tenant_column else None
+    decisions: list[ColumnDecision] = []
+    for table in tables:
+        names = {c.name.lower(): c.name for c in table.columns}
+        key_columns = {name.lower() for fk in table.foreign_keys for name in fk.columns}
+        if tenant is not None:
+            key_columns.add(tenant)
+        table_tenant = names.get(tenant) if tenant is not None else None
+        table_reason: SkipReason | None = None
+        if table.table_type == "VIEW":
+            table_reason = "VIEW"
+        elif table.row_estimate is not None and table.row_estimate > max_rows:
+            table_reason = "TOO_MANY_ROWS"
+        elif tenant is not None and table_tenant is None:
+            table_reason = "NO_TENANT_KEY"
+        for column in table.columns:
+            if column.data_type not in SHORT_TEXT_TYPES | LONG_TEXT_TYPES:
+                continue
+            key = f"{table.name}.{column.name}"
+            reason: SkipReason | None
+            if key in exclude:
+                reason = "EXCLUDED"
+            elif table_reason is not None:
+                reason = table_reason
+            else:
+                reason = _column_reason(column, key_columns, included=key in include)
+            decisions.append(ColumnDecision(table.name, column.name, table_tenant, reason))
+    return decisions
+
+
+def normalize_value(value: str) -> str:
+    """NFKC, case-folded, whitespace collapsed: `"ＷeChat  支付"` -> `"wechat 支付"`."""
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+@dataclass(frozen=True)
+class QueryTerms:
+    grams: tuple[str, ...]  # substrings for exact lookup, longest first
+    spans: tuple[str, ...]  # whole word runs for fuzzy lookup
+
+
+def query_terms(
+    text: str, *, min_len: int = 2, max_len: int = 16, max_grams: int = 2000
+) -> QueryTerms:
+    """Split a question into lookup terms without a Chinese word segmenter.
+
+    Every substring of 2..16 characters of each word run is an exact-match
+    candidate, so a value that appears verbatim anywhere in the question
+    ("华东区", "微信") is found. Whole runs are fuzzy candidates for variants
+    ("华东精密" vs "华东精密有限公司").
+    """
+    runs = [run for run in _WORD.findall(normalize_value(text)) if len(run) >= min_len]
+    grams: list[str] = []
+    seen: set[str] = set()
+    for length in range(max_len, min_len - 1, -1):
+        for run in runs:
+            for start in range(len(run) - length + 1):
+                gram = run[start : start + length]
+                if gram not in seen:
+                    seen.add(gram)
+                    grams.append(gram)
+    return QueryTerms(grams=tuple(grams[:max_grams]), spans=tuple(dict.fromkeys(runs)))
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest tests/unit/metadata/test_value_index.py -v`
+Expected: `7 passed`。
+
+- [ ] **Step 5: Quality gates**
+
+Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
+Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add src/text2sql/metadata/value_index.py tests/unit/metadata/test_value_index.py
+git commit -m "feat(metadata): add value index column rules and query terms"
+git push origin main
+```
+
+---
+
+### Task 15: 值采集器 `collector/values.py`（M10、spec 4.11，验收 15 的采集部分）
+
+**Files:**
+- Create: `src/text2sql/metadata/collector/values.py`
+- Test: `tests/unit/metadata/test_collector_values.py`, `tests/integration/metadata/test_collector_values.py`
+
+**Interfaces:**
+- Consumes: Task 14 `ColumnDecision`、`plan_value_columns`；Task 5 `collect_snapshot`（集成测试用它拿表结构）；Task 6 `mysql_fixture`。
+- Produces（`text2sql.metadata.collector.values`）:
+  - `CollectedColumn(table, column, values: tuple[tuple[str | None, str], ...], skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT"] | None)`，`values` 为 `(tenant_key, value)`，按租户、值排序。
+  - `quote_identifier(name) -> str`（反引号转义）；`distinct_values_sql(table, column, *, tenant_column, timeout_ms) -> str`：`SELECT /*+ MAX_EXECUTION_TIME(ms) */ DISTINCT [tenant,] col FROM t WHERE col IS NOT NULL AND col <> '' LIMIT :limit`。
+  - `collect_values(engine, decisions, *, max_distinct, max_length, timeout_ms) -> list[CollectedColumn]`：只处理 `eligible` 的列，每列一条查询，`LIMIT max_distinct + 1`，超过即 `TOO_MANY_VALUES`；MySQL 错误码 3024（8.0 `MAX_EXECUTION_TIME` 超时）或 1969（MariaDB）记为 `TIMEOUT`，其他错误照常抛出；超过 `max_length` 的值丢弃。
+  - `TIMEOUT_ERROR_CODES = frozenset({3024, 1969})`、`mysql_error_code(exc) -> int | None`。
+
+这是 Spec 02 里唯一读业务行的代码（spec 2.2 的 Profiling 例外，架构 17.1 修订）。约束都在 SQL 里：只用 `get_business_engine()`（`t2s_ro`、只读会话），每列一条带 `MAX_EXECUTION_TIME` 优化器提示的查询（MySQL 5.7.8+ 支持；MariaDB 会忽略这个提示，所以 1969 只是兜底），`LIMIT` 封顶，表名列名只来自快照并经 `quote_identifier` 转义（因此 f-string 那一行的 `# noqa: S608` 是安全的）。
+
+集成测试在夹具表 `t_customer` 里用 root 插 4 行（租户 1001、1002），断言 `code` 列因 `NAME_PATTERN` 跳过、`name` 被收集且按租户分开，`t_work_order` 没有 `tenant_id` 所以 `NO_TENANT_KEY`，视图 `VIEW`；再用 `max_distinct=2` 验证 `TOO_MANY_VALUES`。
+
+- [ ] **Step 1: Write the failing unit tests**
+
+Create `tests/unit/metadata/test_collector_values.py`:
+
+```python
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from typing import Any, cast
+
+import pytest
+from sqlalchemy import Engine
+from sqlalchemy.exc import OperationalError
+
+from text2sql.metadata.collector.values import (
+    collect_values,
+    distinct_values_sql,
+    mysql_error_code,
+    quote_identifier,
+)
+from text2sql.metadata.value_index import ColumnDecision
+
+
+def test_quote_identifier_escapes_backticks() -> None:
+    assert quote_identifier("t_order") == "`t_order`"
+    assert quote_identifier("we`ird") == "`we``ird`"
+
+
+def test_distinct_values_sql_with_and_without_tenant() -> None:
+    sql = distinct_values_sql("t_customer", "region", tenant_column="tenant_id", timeout_ms=3000)
+    assert sql == (
+        "SELECT /*+ MAX_EXECUTION_TIME(3000) */ DISTINCT CAST(`tenant_id` AS CHAR) AS tenant_key, "
+        "`region` AS value FROM `t_customer` WHERE `region` IS NOT NULL AND `region` <> '' "
+        "AND CHAR_LENGTH(`region`) <= :max_length LIMIT :limit"
+    )
+    assert "NULL AS tenant_key" in distinct_values_sql(
+        "t_tag", "tag", tenant_column=None, timeout_ms=10
+    )
+
+
+class _Result:
+    def __init__(self, rows: list[tuple[Any, Any]]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[tuple[Any, Any]]:
+        return self._rows
+
+
+class _Conn:
+    def __init__(self, answers: Mapping[str, list[tuple[Any, Any]] | Exception]) -> None:
+        self.answers = answers
+        self.params: list[Mapping[str, Any]] = []
+
+    def execute(self, statement: Any, params: Mapping[str, Any]) -> _Result:
+        self.params.append(params)
+        for column, answer in self.answers.items():
+            if f"`{column}` AS value" in str(statement):
+                if isinstance(answer, Exception):
+                    raise answer
+                return _Result(answer)
+        raise AssertionError(statement)
+
+
+class _Engine:
+    def __init__(self, conn: _Conn) -> None:
+        self.conn = conn
+
+    @contextmanager
+    def connect(self) -> Iterator[_Conn]:
+        yield self.conn
+
+
+def _decision(column: str, reason: Any = None) -> ColumnDecision:
+    return ColumnDecision("t_customer", column, "tenant_id", reason)
+
+
+def _timeout(code: int) -> OperationalError:
+    return OperationalError("SELECT", {}, Exception(code, "timeout"))
+
+
+def test_collect_values_classifies_columns() -> None:
+    conn = _Conn(
+        {
+            "region": [("1001", "华东区"), ("1002", b"\xe5\x8d\x8e\xe5\x8d\x97")],
+            "level": [(None, "A"), (None, "B"), (None, "C")],
+            "slow": _timeout(3024),
+        }
+    )
+    decisions = [
+        _decision("region"),
+        _decision("level"),
+        _decision("slow"),
+        _decision("skipped", "NAME_PATTERN"),
+    ]
+    collected = collect_values(
+        cast(Engine, _Engine(conn)), decisions, max_distinct=2, max_length=64, timeout_ms=100
+    )
+    assert [(c.key, c.skip_reason, c.values) for c in collected] == [
+        ("t_customer.region", None, (("1001", "华东区"), ("1002", "华南"))),
+        ("t_customer.level", "TOO_MANY_VALUES", ()),
+        ("t_customer.slow", "TIMEOUT", ()),
+    ]
+    assert conn.params[0] == {"max_length": 64, "limit": 3}
+
+
+def test_other_operational_errors_propagate() -> None:
+    conn = _Conn({"region": _timeout(1045)})
+    with pytest.raises(OperationalError):
+        collect_values(
+            cast(Engine, _Engine(conn)),
+            [_decision("region")],
+            max_distinct=10,
+            max_length=64,
+            timeout_ms=100,
+        )
+
+
+def test_mysql_error_code() -> None:
+    assert mysql_error_code(_timeout(1969)) == 1969
+    assert mysql_error_code(OperationalError("x", {}, Exception("no code"))) is None
+```
+
+- [ ] **Step 2: Write the failing integration test**
+
+Create `tests/integration/metadata/test_collector_values.py`:
+
+```python
+import pytest
+
+from tests.integration.metadata.conftest import MysqlFixture
+from text2sql.db.business import get_business_engine
+from text2sql.metadata.collector.mysql import collect_snapshot
+from text2sql.metadata.collector.values import collect_values
+from text2sql.metadata.value_index import plan_value_columns
+
+pytestmark = pytest.mark.integration
+
+ROWS = """
+INSERT INTO t_customer (id, tenant_id, code, name) VALUES
+  (1, 1001, 'C1', '华东精密有限公司'),
+  (2, 1001, 'C2', '华南重工'),
+  (3, 1002, 'C3', '北方机械'),
+  (4, 1002, 'C4', '北方机械')
+"""
+
+
+def test_collects_distinct_values_with_tenant_keys(mysql_fixture: MysqlFixture) -> None:
+    mysql_fixture.execute(ROWS)
+    engine = get_business_engine()
+    data = collect_snapshot(engine, mysql_fixture.datasource_id)
+    decisions = plan_value_columns(data.tables, tenant_column="tenant_id", max_rows=1000)
+    reasons = {d.key: d.skip_reason for d in decisions}
+    assert reasons == {
+        "t_customer.code": "NAME_PATTERN",
+        "t_customer.name": None,
+        "t_work_order.order_no": "NO_TENANT_KEY",
+        "t_work_order.status": "NO_TENANT_KEY",
+        "t_work_process.note": "NO_TENANT_KEY",
+        "v_open_orders.order_no": "VIEW",
+    }
+
+    collected = collect_values(engine, decisions, max_distinct=10, max_length=128, timeout_ms=3000)
+    assert [(c.key, c.skip_reason) for c in collected] == [("t_customer.name", None)]
+    assert sorted(collected[0].values) == [
+        ("1001", "华东精密有限公司"),
+        ("1001", "华南重工"),
+        ("1002", "北方机械"),
+    ]
+
+    too_many = collect_values(engine, decisions, max_distinct=2, max_length=128, timeout_ms=3000)
+    assert [(c.key, c.skip_reason, c.values) for c in too_many] == [
+        ("t_customer.name", "TOO_MANY_VALUES", ())
+    ]
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `uv run pytest tests/unit/metadata/test_collector_values.py -v`
+Expected: collection ERROR：`ModuleNotFoundError: No module named 'text2sql.metadata.collector.values'`。
+
+- [ ] **Step 4: Implement the value collector**
+
+Create `src/text2sql/metadata/collector/values.py`:
+
+```python
+"""Distinct values of the value-index columns (Spec 02 M10).
+
+This is the only part of Spec 02 that reads business rows. It runs on the same
+read-only `t2s_ro` engine as the structure collector, one bounded query per
+column:
+
+* `MAX_EXECUTION_TIME` hint (MySQL 5.7.8+) stops a slow scan on the server;
+  the column is then recorded as `TIMEOUT` instead of failing the build.
+* `LIMIT max_distinct + 1` tells "too many values" apart without counting.
+* the tenant column is selected next to the value, so search can filter by
+  tenant and the index never leaks values across tenants.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from sqlalchemy import Engine, text
+from sqlalchemy.exc import OperationalError
+
+from text2sql.metadata.value_index import ColumnDecision
+
+# MySQL ER_QUERY_TIMEOUT (MAX_EXECUTION_TIME exceeded); MariaDB ER_STATEMENT_TIMEOUT.
+TIMEOUT_ERROR_CODES = frozenset({3024, 1969})
+
+
+@dataclass(frozen=True)
+class CollectedColumn:
+    table: str
+    column: str
+    values: tuple[tuple[str | None, str], ...]  # (tenant_key, value), empty when skipped
+    skip_reason: Literal["TOO_MANY_VALUES", "TIMEOUT"] | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.table}.{self.column}"
+
+
+def quote_identifier(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+
+def distinct_values_sql(
+    table: str, column: str, *, tenant_column: str | None, timeout_ms: int
+) -> str:
+    col = quote_identifier(column)
+    tenant = f"CAST({quote_identifier(tenant_column)} AS CHAR)" if tenant_column else "NULL"
+    # Identifiers come from the snapshot and are backtick-quoted; values are bound.
+    return (
+        f"SELECT /*+ MAX_EXECUTION_TIME({int(timeout_ms)}) */ DISTINCT "  # noqa: S608
+        f"{tenant} AS tenant_key, {col} AS value "
+        f"FROM {quote_identifier(table)} "
+        f"WHERE {col} IS NOT NULL AND {col} <> '' AND CHAR_LENGTH({col}) <= :max_length "
+        "LIMIT :limit"
+    )
+
+
+def mysql_error_code(exc: OperationalError) -> int | None:
+    args = getattr(exc.orig, "args", ())
+    return args[0] if args and isinstance(args[0], int) else None
+
+
+def _text(value: Any) -> str:
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+def collect_values(
+    engine: Engine,
+    decisions: Sequence[ColumnDecision],
+    *,
+    max_distinct: int,
+    max_length: int,
+    timeout_ms: int,
+) -> list[CollectedColumn]:
+    """Read the eligible columns; skipped decisions are not queried."""
+    collected: list[CollectedColumn] = []
+    with engine.connect() as conn:
+        for decision in decisions:
+            if not decision.eligible:
+                continue
+            sql = distinct_values_sql(
+                decision.table,
+                decision.column,
+                tenant_column=decision.tenant_column,
+                timeout_ms=timeout_ms,
+            )
+            try:
+                rows = conn.execute(
+                    text(sql), {"max_length": max_length, "limit": max_distinct + 1}
+                ).all()
+            except OperationalError as exc:
+                if mysql_error_code(exc) not in TIMEOUT_ERROR_CODES:
+                    raise
+                collected.append(CollectedColumn(decision.table, decision.column, (), "TIMEOUT"))
+                continue
+            if len(rows) > max_distinct:
+                collected.append(
+                    CollectedColumn(decision.table, decision.column, (), "TOO_MANY_VALUES")
+                )
+                continue
+            values = tuple(
+                (None if tenant is None else _text(tenant), _text(value)) for tenant, value in rows
+            )
+            collected.append(CollectedColumn(decision.table, decision.column, values, None))
+    return collected
+```
+
+- [ ] **Step 5: Run unit tests**
+
+Run: `uv run pytest tests/unit/metadata/test_collector_values.py -v`
+Expected: `5 passed`。
+
+- [ ] **Step 6: Run integration test**
+
+Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_collector_values.py -v`
+Expected: `2 passed`（`mysql57`、`mysql80` 各一次）。
+
+- [ ] **Step 7: Quality gates**
+
+Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
+Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
+
+- [ ] **Step 8: Commit and push**
+
+```bash
+git add src/text2sql/metadata/collector/values.py tests/unit/metadata/test_collector_values.py tests/integration/metadata/test_collector_values.py
+git commit -m "feat(metadata): collect distinct values of eligible columns with bounded queries"
+git push origin main
+```
+
+---
+
+### Task 16: 值索引存储与检索 `catalog/value_store.py`（M10、spec 4.11，验收 16）
+
+**Files:**
+- Create: `src/text2sql/metadata/catalog/value_store.py`
+- Test: `tests/integration/metadata/test_value_store.py`
+
+**Interfaces:**
+- Consumes: Task 7 的 `MetadataValueBuild`、`MetadataValueColumn`、`MetadataValue` 与 `pg_trgm`；Task 14 `ColumnDecision`、`normalize_value`、`query_terms`；Task 15 `CollectedColumn`；Task 9 `save_snapshot`（测试里建数据源和快照行）。
+- Produces（`text2sql.metadata.catalog.value_store`）:
+  - `ValueBuildSummary(build_id, datasource_id, snapshot_id, indexed_column_count, skipped_column_count, value_count, created_at, created_by)`；`ValueHit(column_key, value, score, exact)`（frozen dataclass）。
+  - `save_value_build(session, *, datasource_id, snapshot_id, decisions, collected, created_by) -> int`：写一次构建（每个决定一行 `metadata_value_column`，含跳过原因与值数），然后删掉该数据源最近 `KEEP_BUILDS = 2` 次以外的旧构建（级联删列和值）。
+  - `latest_value_build(session, datasource_id) -> ValueBuildSummary | None`；`value_columns(session, build_id) -> list[tuple[str, str | None, int]]`。
+  - `search_values(session, *, datasource_id, text_value, tenant_key, limit=10, min_score=0.6, columns=None) -> list[ValueHit]`：只查最新构建；先精确（`value_norm IN :grams`，score 1.0），再对每个长度 ≤ `MAX_FUZZY_SPAN = 32` 的词串做 `:span <% value_norm` 模糊匹配（score = `word_similarity`）；**总是**按 `tenant_key IS NOT DISTINCT FROM :tenant` 过滤；按 score 降序去重。
+
+模糊匹配用 `word_similarity`（问题里的词串和值里「最像的一段」比较）而不是 `similarity`（整串比较）：「华东精密」对「华东精密有限公司」的 `similarity` 只有约 0.4，`word_similarity` 是 0.8。`<%` 运算符能用 GIN `gin_trgm_ops` 索引；阈值用 `set_config('pg_trgm.word_similarity_threshold', :t, true)` 设成事务级（第三个参数 `true`），不影响同一连接上的其他事务。
+
+参考：CHESS 用 LSH 做值检索，LinkedIn SQL Bot 和 supersonic 都先在值词典里找实体再生成 SQL；这里用 PG 自带的 `pg_trgm`，不引入新组件。租户过滤写在 SQL 里而不是交给调用方，`tenant_key=None` 只匹配单租户库里 `tenant_key IS NULL` 的值。
+
+- [ ] **Step 1: Write the failing integration tests**
+
+Create `tests/integration/metadata/test_value_store.py`:
+
+```python
+import pytest
+from sqlalchemy import Engine, func, select
+from sqlalchemy.orm import Session
+
+from tests.metadata_factories import make_snapshot_data
+from text2sql.metadata.catalog.models import MetadataValue, MetadataValueBuild
+from text2sql.metadata.catalog.repository import save_snapshot
+from text2sql.metadata.catalog.value_store import (
+    latest_value_build,
+    save_value_build,
+    search_values,
+    value_columns,
+)
+from text2sql.metadata.collector.values import CollectedColumn
+from text2sql.metadata.value_index import ColumnDecision
+
+pytestmark = pytest.mark.integration
+
+DECISIONS = (
+    ColumnDecision("t_customer", "name", "tenant_id", None),
+    ColumnDecision("t_customer", "region", "tenant_id", None),
+    ColumnDecision("t_customer", "level", "tenant_id", None),
+    ColumnDecision("t_customer", "code", "tenant_id", "NAME_PATTERN"),
+)
+COLLECTED = (
+    CollectedColumn(
+        "t_customer",
+        "name",
+        (("1001", "华东精密有限公司"), ("1001", "华南重工"), ("1002", "北方机械")),
+        None,
+    ),
+    CollectedColumn("t_customer", "region", (("1001", "华东区"), ("1002", "华东区")), None),
+    CollectedColumn("t_customer", "level", (), "TOO_MANY_VALUES"),
+)
+
+
+def _build(session: Session, created_by: str = "test") -> int:
+    snapshot_id = save_snapshot(session, make_snapshot_data()).snapshot_id
+    return save_value_build(
+        session,
+        datasource_id="ds_test",
+        snapshot_id=snapshot_id,
+        decisions=DECISIONS,
+        collected=COLLECTED,
+        created_by=created_by,
+    )
+
+
+def test_save_records_every_column_and_counts(metadata_db: Engine) -> None:
+    with Session(metadata_db) as session, session.begin():
+        build_id = _build(session)
+        summary = latest_value_build(session, "ds_test")
+        assert summary is not None
+        assert summary.build_id == build_id
+        assert (summary.indexed_column_count, summary.skipped_column_count) == (2, 2)
+        assert summary.value_count == 5
+        assert value_columns(session, build_id) == [
+            ("t_customer.code", "NAME_PATTERN", 0),
+            ("t_customer.level", "TOO_MANY_VALUES", 0),
+            ("t_customer.name", None, 3),
+            ("t_customer.region", None, 2),
+        ]
+
+
+def test_exact_and_fuzzy_search_are_tenant_scoped(metadata_db: Engine) -> None:
+    with Session(metadata_db) as session, session.begin():
+        _build(session)
+        hits = search_values(
+            session,
+            datasource_id="ds_test",
+            text_value="华东区上月华东精密的工单",
+            tenant_key="1001",
+        )
+        assert [(h.column_key, h.value, h.exact) for h in hits][:1] == [
+            ("t_customer.region", "华东区", True)
+        ]
+        other = search_values(
+            session, datasource_id="ds_test", text_value="华东精密", tenant_key="1001"
+        )
+        assert [(h.value, h.exact) for h in other] == [("华东精密有限公司", False)]
+        assert other[0].score >= 0.6
+        assert (
+            search_values(
+                session, datasource_id="ds_test", text_value="华东精密", tenant_key="1002"
+            )
+            == []
+        )
+        assert (
+            search_values(session, datasource_id="ds_test", text_value="北方机械", tenant_key=None)
+            == []
+        )
+        only_region = search_values(
+            session,
+            datasource_id="ds_test",
+            text_value="华东区",
+            tenant_key="1002",
+            columns={"t_customer.name"},
+        )
+        assert only_region == []
+
+
+def test_search_without_a_build_returns_nothing(metadata_db: Engine) -> None:
+    with Session(metadata_db) as session:
+        assert (
+            search_values(session, datasource_id="ds_test", text_value="x", tenant_key=None) == []
+        )
+        assert latest_value_build(session, "ds_test") is None
+
+
+def test_only_the_latest_two_builds_are_kept(metadata_db: Engine) -> None:
+    with Session(metadata_db) as session, session.begin():
+        first = _build(session, "first")
+        second = _build(session, "second")
+        third = _build(session, "third")
+        builds = session.scalars(select(MetadataValueBuild.id).order_by(MetadataValueBuild.id))
+        assert list(builds) == [second, third]
+        assert first not in {
+            row for row in session.scalars(select(MetadataValue.build_id).distinct())
+        }
+        assert session.scalar(select(func.count()).select_from(MetadataValue)) == 10
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_value_store.py -v`
+Expected: collection ERROR：`ModuleNotFoundError: No module named 'text2sql.metadata.catalog.value_store'`。
+
+- [ ] **Step 3: Implement value storage and search**
+
+Create `src/text2sql/metadata/catalog/value_store.py`:
+
+```python
+"""Store and search value-index builds (Spec 02 4.11). Callers own the transaction.
+
+A build is written in one transaction after all values are collected, so a
+reader sees either the previous build or the complete new one. Only the
+latest `KEEP_BUILDS` builds of a data source are kept; older ones are deleted
+(the child rows go with them through `ON DELETE CASCADE`).
+"""
+
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+
+from sqlalchemy import bindparam, delete, insert, select, text
+from sqlalchemy.orm import Session
+
+from text2sql.common.tracing import get_trace_id
+from text2sql.metadata.catalog.models import MetadataValue, MetadataValueBuild, MetadataValueColumn
+from text2sql.metadata.collector.values import CollectedColumn
+from text2sql.metadata.value_index import ColumnDecision, normalize_value, query_terms
+
+KEEP_BUILDS = 2
+MAX_FUZZY_SPAN = 32
+
+
+@dataclass(frozen=True)
+class ValueBuildSummary:
+    build_id: int
+    datasource_id: str
+    snapshot_id: int
+    indexed_column_count: int
+    skipped_column_count: int
+    value_count: int
+    created_at: datetime
+    created_by: str
+
+
+@dataclass(frozen=True)
+class ValueHit:
+    column_key: str  # "table.column"
+    value: str
+    score: float  # 1.0 for an exact match, otherwise pg_trgm word similarity
+    exact: bool
+
+
+def save_value_build(
+    session: Session,
+    *,
+    datasource_id: str,
+    snapshot_id: int,
+    decisions: Sequence[ColumnDecision],
+    collected: Sequence[CollectedColumn],
+    created_by: str,
+) -> int:
+    by_key = {c.key: c for c in collected}
+    rows: list[tuple[str, str | None, tuple[tuple[str | None, str], ...]]] = []
+    for decision in decisions:
+        found = by_key.get(decision.key)
+        reason = decision.skip_reason or (found.skip_reason if found else None)
+        values = found.values if found is not None and reason is None else ()
+        rows.append((decision.key, reason, values))
+    build = MetadataValueBuild(
+        datasource_id=datasource_id,
+        snapshot_id=snapshot_id,
+        indexed_column_count=sum(1 for row in rows if row[1] is None),
+        skipped_column_count=sum(1 for row in rows if row[1] is not None),
+        value_count=sum(len(row[2]) for row in rows),
+        created_by=created_by,
+        trace_id=get_trace_id(),
+    )
+    session.add(build)
+    session.flush()
+    for key, skip_reason, column_values in rows:
+        column = MetadataValueColumn(
+            build_id=build.id,
+            column_key=key,
+            skip_reason=skip_reason,
+            value_count=len(column_values),
+        )
+        session.add(column)
+        session.flush()
+        if column_values:
+            session.execute(
+                insert(MetadataValue),
+                [
+                    {
+                        "build_id": build.id,
+                        "column_id": column.id,
+                        "tenant_key": tenant,
+                        "value": value,
+                        "value_norm": normalize_value(value),
+                    }
+                    for tenant, value in column_values
+                ],
+            )
+    keep = (
+        select(MetadataValueBuild.id)
+        .where(MetadataValueBuild.datasource_id == datasource_id)
+        .order_by(MetadataValueBuild.id.desc())
+        .limit(KEEP_BUILDS)
+    )
+    session.execute(
+        delete(MetadataValueBuild).where(
+            MetadataValueBuild.datasource_id == datasource_id,
+            MetadataValueBuild.id.not_in(keep.scalar_subquery()),
+        )
+    )
+    return build.id
+
+
+def latest_value_build(session: Session, datasource_id: str) -> ValueBuildSummary | None:
+    build = session.scalars(
+        select(MetadataValueBuild)
+        .where(MetadataValueBuild.datasource_id == datasource_id)
+        .order_by(MetadataValueBuild.id.desc())
+        .limit(1)
+    ).first()
+    if build is None:
+        return None
+    return ValueBuildSummary(
+        build_id=build.id,
+        datasource_id=build.datasource_id,
+        snapshot_id=build.snapshot_id,
+        indexed_column_count=build.indexed_column_count,
+        skipped_column_count=build.skipped_column_count,
+        value_count=build.value_count,
+        created_at=build.created_at,
+        created_by=build.created_by,
+    )
+
+
+def value_columns(session: Session, build_id: int) -> list[tuple[str, str | None, int]]:
+    """`(column_key, skip_reason, value_count)` for every column the build considered."""
+    rows = session.execute(
+        select(
+            MetadataValueColumn.column_key,
+            MetadataValueColumn.skip_reason,
+            MetadataValueColumn.value_count,
+        )
+        .where(MetadataValueColumn.build_id == build_id)
+        .order_by(MetadataValueColumn.column_key)
+    )
+    return [(key, reason, count) for key, reason, count in rows]
+
+
+# `tenant_key IS NOT DISTINCT FROM :tenant`: with a tenant only that tenant's
+# values match; with None only values of tables without a tenant column match.
+_EXACT_SQL = text(
+    """
+    SELECT c.column_key, v.value
+    FROM metadata_value v JOIN metadata_value_column c ON c.id = v.column_id
+    WHERE v.build_id = :build_id
+      AND v.value_norm IN :grams
+      AND v.tenant_key IS NOT DISTINCT FROM :tenant
+    """
+).bindparams(bindparam("grams", expanding=True))
+
+_FUZZY_SQL = text(
+    """
+    SELECT c.column_key, v.value, word_similarity(:span, v.value_norm) AS score
+    FROM metadata_value v JOIN metadata_value_column c ON c.id = v.column_id
+    WHERE v.build_id = :build_id
+      AND :span <% v.value_norm
+      AND v.tenant_key IS NOT DISTINCT FROM :tenant
+    ORDER BY score DESC, c.column_key, v.value
+    LIMIT :limit
+    """
+)
+
+
+def search_values(
+    session: Session,
+    *,
+    datasource_id: str,
+    text_value: str,
+    tenant_key: str | None,
+    limit: int = 10,
+    min_score: float = 0.6,
+    columns: Collection[str] | None = None,
+) -> list[ValueHit]:
+    """Values of the latest build that appear in, or resemble part of, `text_value`.
+
+    Exact: a normalised substring of the question equals a value ("华东区").
+    Fuzzy: pg_trgm `word_similarity(span, value) >= min_score` ("华东精密" ->
+    "华东精密有限公司"). Returns [] when the data source has no build yet.
+    """
+    build = latest_value_build(session, datasource_id)
+    if build is None:
+        return []
+    terms = query_terms(text_value)
+    hits: dict[tuple[str, str], ValueHit] = {}
+    if terms.grams:
+        params = {"build_id": build.build_id, "grams": list(terms.grams), "tenant": tenant_key}
+        for key, value in session.execute(_EXACT_SQL, params):
+            hits[(key, value)] = ValueHit(key, value, 1.0, True)
+    # `<%` filters with this setting (default 0.6); `true` = local to the transaction.
+    session.execute(
+        text("SELECT set_config('pg_trgm.word_similarity_threshold', :t, true)"),
+        {"t": str(min_score)},
+    )
+    for span in terms.spans:
+        if len(span) > MAX_FUZZY_SPAN:
+            continue
+        params = {"build_id": build.build_id, "span": span, "tenant": tenant_key, "limit": limit}
+        for key, value, score in session.execute(_FUZZY_SQL, params):
+            if (key, value) not in hits:
+                hits[(key, value)] = ValueHit(key, value, round(float(score), 4), False)
+    found = [h for h in hits.values() if columns is None or h.column_key in columns]
+    found.sort(key=lambda h: (-h.score, h.column_key, h.value))
+    return found[:limit]
+```
+
+- [ ] **Step 4: Run integration tests**
+
+Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_value_store.py -v`
+Expected: `4 passed`。
+
+- [ ] **Step 5: Quality gates**
+
+Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
+Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add src/text2sql/metadata/catalog/value_store.py tests/integration/metadata/test_value_store.py
+git commit -m "feat(metadata): store value index builds and search them with pg_trgm"
+git push origin main
+```
+
+---
+
+### Task 17: 同步与值索引服务、队列任务 `metadata.sync` / `metadata.value_index`（M8 队列部分、M10，验收 2、3、5、6、15 端到端）
 
 **Files:**
 - Create: `src/text2sql/metadata/jobs.py`
@@ -4663,12 +6179,17 @@ git push origin main
 - Test: `tests/unit/metadata/test_sync_job.py`, `tests/integration/metadata/test_sync.py`
 
 **Interfaces:**
-- Consumes: Task 5 `collect_snapshot`；Task 9 `save_snapshot`；Spec 01 `register`、`NonRetryableJobError`、`get_business_engine`、`session_scope`、`enqueue`、`run_once`。
+- Consumes: Task 5 `collect_snapshot`；Task 9 `save_snapshot`、`latest_snapshot_id`、`load_snapshot`；Task 14 `plan_value_columns`；Task 15 `collect_values`；Task 16 `save_value_build`、`search_values`；Spec 01 `register`、`NonRetryableJobError`、`get_business_engine`、`session_scope`、`enqueue`、`run_once`。
 - Produces:
   - `text2sql.metadata.jobs.SYNC_KIND = "metadata.sync"`、`SyncResult(snapshot_id, unchanged, table_count, column_count, flagged_comment_count)`
   - `run_sync(requested_by: str) -> SyncResult`：采集 → 保存 → 日志 `metadata_sync_started` / `metadata_sync_finished`（字段 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`；`trace_id` 由 Spec 01 的 JSON formatter 自动带上）
   - `handle_sync(payload)`，`@register("metadata.sync")`；`payload["datasource_id"] != Settings.datasource_id` 时抛 `NonRetryableJobError`
+  - `VALUE_INDEX_KIND = "metadata.value_index"`、`ValueIndexResult(build_id, snapshot_id, indexed_column_count, skipped_column_count, value_count)`
+  - `run_value_index(requested_by, *, include=(), exclude=()) -> ValueIndexResult`：取最新快照（没有则 `AppError(METADATA_SNAPSHOT_NOT_FOUND, …, 404)`）→ `plan_value_columns`（`tenant_column = Settings.value_index_tenant_column or None`）→ `collect_values` → `save_value_build`；日志 `metadata_value_index_finished`。采集在事务外进行，只有保存占用 PG 事务。
+  - `handle_value_index(payload)`，`@register("metadata.value_index")`；payload `{"datasource_id", "requested_by", "include"?: [...], "exclude"?: [...]}`，数据源检查同 `handle_sync`
   - `text2sql.jobs.worker.HANDLER_MODULES`、`load_handler_modules()`
+
+值索引是独立任务而不是 `run_sync` 的一部分：结构采集只读 `information_schema`、很快；值采集要扫业务表、可能几分钟，而且以后 Spec 09 会在每次 sync 有变化后自动入队 `metadata.value_index`（spec 09 修订）。两者都只用 `Settings.datasource_id`，payload 里的数据源只用来校验。
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -4694,6 +6215,7 @@ def test_handler_is_registered_by_worker_loader() -> None:
     worker.load_handler_modules()
     assert "metadata.sync" in worker.registered_kinds()
     assert worker._HANDLERS["metadata.sync"] is jobs.handle_sync
+    assert worker._HANDLERS["metadata.value_index"] is jobs.handle_value_index
 
 
 def test_mismatched_datasource_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4749,6 +6271,24 @@ def test_run_sync_counts_and_logs(
     assert finished[0].snapshot_id == 7  # type: ignore[attr-defined]
     assert finished[0].unchanged is False  # type: ignore[attr-defined]
     assert finished[0].elapsed_ms >= 0  # type: ignore[attr-defined]
+
+
+def test_value_index_job_checks_datasource_and_passes_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("T2S_DATASOURCE_ID", "local_mysql80")
+    calls: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+
+    def fake_run(requested_by: str, *, include: Any, exclude: Any) -> None:
+        calls.append((requested_by, tuple(include), tuple(exclude)))
+
+    monkeypatch.setattr(jobs, "run_value_index", fake_run)
+    with pytest.raises(NonRetryableJobError):
+        jobs.handle_value_index({"datasource_id": "local_mysql57"})
+    jobs.handle_value_index(
+        {"datasource_id": "local_mysql80", "requested_by": "ops", "exclude": ["t.c"]}
+    )
+    assert calls == [("ops", (), ("t.c",))]
 ```
 
 - [ ] **Step 2: Write the failing integration tests**
@@ -4760,13 +6300,15 @@ import pytest
 from sqlalchemy import Engine
 
 from tests.integration.metadata.conftest import MysqlFixture
+from text2sql.common.errors import AppError
 from text2sql.db.models import Job
 from text2sql.db.system import session_scope
 from text2sql.jobs import worker
 from text2sql.jobs.queue import enqueue
 from text2sql.metadata.catalog.repository import load_snapshot
+from text2sql.metadata.catalog.value_store import search_values
 from text2sql.metadata.comment_review import comment_visible, record_review
-from text2sql.metadata.jobs import SYNC_KIND, run_sync
+from text2sql.metadata.jobs import SYNC_KIND, VALUE_INDEX_KIND, run_sync, run_value_index
 from text2sql.metadata.snapshot import SchemaSnapshot
 
 pytestmark = pytest.mark.integration
@@ -4879,6 +6421,40 @@ def test_queue_job_runs_sync_and_rejects_other_datasource(
         assert ok.status == "succeeded"
         assert (bad.status, bad.attempts) == ("failed", 1)
         assert "NonRetryableJobError" in (bad.last_error or "")
+
+
+def test_value_index_job_builds_from_latest_snapshot(
+    metadata_db: Engine, mysql_fixture: MysqlFixture
+) -> None:
+    with pytest.raises(AppError, match="no snapshot"):
+        run_value_index("tester")
+    mysql_fixture.execute(
+        "INSERT INTO t_customer (id, tenant_id, code, name) VALUES "
+        "(1, 1001, 'C1', '华东精密有限公司'), (2, 1002, 'C2', '北方机械')"
+    )
+    run_sync("tester")
+    result = run_value_index("tester")
+    assert (result.indexed_column_count, result.value_count) == (1, 2)
+    with session_scope() as session:
+        hits = search_values(
+            session,
+            datasource_id=mysql_fixture.datasource_id,
+            text_value="华东精密",
+            tenant_key="1001",
+        )
+    assert [(h.column_key, h.value) for h in hits] == [("t_customer.name", "华东精密有限公司")]
+
+    with session_scope() as session:
+        job_id = enqueue(
+            session,
+            VALUE_INDEX_KIND,
+            {"datasource_id": mysql_fixture.datasource_id, "requested_by": "queue"},
+        )
+    while worker.run_once(lease_s=60):
+        pass
+    with session_scope() as session:
+        job = session.get(Job, job_id)
+        assert job is not None and job.status == "succeeded"
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -4891,24 +6467,34 @@ Expected: collection ERROR：`ImportError: cannot import name 'jobs' from 'text2
 Create `src/text2sql/metadata/jobs.py`:
 
 ```python
-"""`metadata.sync`: collect the business schema and save a snapshot (Spec 02 M8)."""
+"""Metadata queue jobs (Spec 02 M8, M10).
+
+* `metadata.sync`: collect the business schema and save a snapshot.
+* `metadata.value_index`: rebuild the value index from the latest snapshot.
+"""
 
 import logging
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
 from text2sql.common.config import get_settings
+from text2sql.common.errors import METADATA_SNAPSHOT_NOT_FOUND, AppError
 from text2sql.db.business import get_business_engine
 from text2sql.db.system import session_scope
 from text2sql.jobs.queue import NonRetryableJobError
 from text2sql.jobs.worker import register
-from text2sql.metadata.catalog.repository import save_snapshot
+from text2sql.metadata.catalog.repository import latest_snapshot_id, load_snapshot, save_snapshot
+from text2sql.metadata.catalog.value_store import save_value_build
 from text2sql.metadata.collector.mysql import collect_snapshot
+from text2sql.metadata.collector.values import collect_values
+from text2sql.metadata.value_index import plan_value_columns
 
 logger = logging.getLogger(__name__)
 
 SYNC_KIND = "metadata.sync"
+VALUE_INDEX_KIND = "metadata.value_index"
 
 
 @dataclass(frozen=True)
@@ -4918,6 +6504,15 @@ class SyncResult:
     table_count: int
     column_count: int
     flagged_comment_count: int
+
+
+@dataclass(frozen=True)
+class ValueIndexResult:
+    build_id: int
+    snapshot_id: int
+    indexed_column_count: int
+    skipped_column_count: int
+    value_count: int
 
 
 def run_sync(requested_by: str) -> SyncResult:
@@ -4952,14 +6547,91 @@ def run_sync(requested_by: str) -> SyncResult:
     return result
 
 
-@register(SYNC_KIND)
-def handle_sync(payload: dict[str, Any]) -> None:
+def run_value_index(
+    requested_by: str, *, include: Collection[str] = (), exclude: Collection[str] = ()
+) -> ValueIndexResult:
+    """Plan columns from the latest snapshot, read their values, save one build.
+
+    The business reads happen outside any system-DB transaction; the build is
+    written in one short transaction at the end.
+    """
+    settings = get_settings()
+    datasource_id = settings.datasource_id
+    started = time.perf_counter()
+    with session_scope() as session:
+        snapshot_id = latest_snapshot_id(session, datasource_id)
+        if snapshot_id is None:
+            raise AppError(METADATA_SNAPSHOT_NOT_FOUND, f"no snapshot for {datasource_id}", 404)
+        tables = load_snapshot(session, snapshot_id).tables
+    decisions = plan_value_columns(
+        tables,
+        tenant_column=settings.value_index_tenant_column or None,
+        max_rows=settings.value_index_max_rows,
+        include=include,
+        exclude=exclude,
+    )
+    collected = collect_values(
+        get_business_engine(),
+        decisions,
+        max_distinct=settings.value_index_max_distinct,
+        max_length=settings.value_index_max_value_length,
+        timeout_ms=settings.value_index_timeout_ms,
+    )
+    with session_scope() as session:
+        build_id = save_value_build(
+            session,
+            datasource_id=datasource_id,
+            snapshot_id=snapshot_id,
+            decisions=decisions,
+            collected=collected,
+            created_by=requested_by,
+        )
+    failed = {c.key for c in collected if c.skip_reason is not None}
+    indexed = sum(1 for d in decisions if d.eligible and d.key not in failed)
+    result = ValueIndexResult(
+        build_id=build_id,
+        snapshot_id=snapshot_id,
+        indexed_column_count=indexed,
+        skipped_column_count=len(decisions) - indexed,
+        value_count=sum(len(c.values) for c in collected),
+    )
+    logger.info(
+        "metadata_value_index_finished",
+        extra={
+            "datasource_id": datasource_id,
+            "build_id": build_id,
+            "snapshot_id": snapshot_id,
+            "indexed_columns": result.indexed_column_count,
+            "values": result.value_count,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        },
+    )
+    return result
+
+
+def _check_datasource(payload: dict[str, Any]) -> None:
     expected = get_settings().datasource_id
     if payload.get("datasource_id") != expected:
         raise NonRetryableJobError(
             f"payload datasource_id {payload.get('datasource_id')!r} != process {expected!r}"
         )
+
+
+@register(SYNC_KIND)
+def handle_sync(payload: dict[str, Any]) -> None:
+    _check_datasource(payload)
     run_sync(str(payload.get("requested_by", "")))
+
+
+@register(VALUE_INDEX_KIND)
+def handle_value_index(payload: dict[str, Any]) -> None:
+    """Payload: `datasource_id`, `requested_by`, optional `include` / `exclude` key lists."""
+    _check_datasource(payload)
+    run_value_index(
+        str(payload.get("requested_by", "")),
+        include=tuple(payload.get("include", ())),
+        exclude=tuple(payload.get("exclude", ())),
+    )
 ```
 
 - [ ] **Step 5: Modify `src/text2sql/jobs/worker.py`**
@@ -4993,12 +6665,12 @@ def load_handler_modules() -> None:
 - [ ] **Step 6: Run unit tests**
 
 Run: `uv run pytest tests/unit/metadata/test_sync_job.py tests/unit/test_worker.py -v`
-Expected: 全部通过（新增 4 个）。
+Expected: 全部通过（新增 5 个）。
 
 - [ ] **Step 7: Run integration tests**
 
 Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_sync.py -v`
-Expected: `8 passed`（4 个用例 × mysql57/mysql80）。
+Expected: `10 passed`（5 个用例 × mysql57/mysql80）。
 
 - [ ] **Step 8: Quality gates**
 
@@ -5009,23 +6681,24 @@ Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）
 
 ```bash
 git add src/text2sql/metadata/jobs.py src/text2sql/jobs/worker.py tests/unit/metadata/test_sync_job.py tests/integration/metadata/test_sync.py
-git commit -m "feat(metadata): add metadata.sync job and load handler modules in worker"
+git commit -m "feat(metadata): add metadata.sync and metadata.value_index jobs and load handler modules"
 git push origin main
 ```
 
 ---
 
-### Task 14: CLI `python -m text2sql.metadata`（M8 CLI，验收 7、11）
+### Task 18: CLI `python -m text2sql.metadata`（M8 CLI，验收 7、11、13、15）
 
 **Files:**
 - Create: `src/text2sql/metadata/__main__.py`, `src/text2sql/metadata/cli.py`
 - Test: `tests/unit/metadata/test_cli.py`, `tests/integration/metadata/test_cli.py`
 
 **Interfaces:**
-- Consumes: Task 9 仓库函数；Task 10 `record_review`、`review_decision`；Task 11 release 函数；Task 13 `run_sync`。
+- Consumes: Task 9 仓库函数；Task 10 `record_review`、`review_decision`；Task 11 release 函数；Task 13 `summarize_structure`；Task 16 `latest_value_build`、`value_columns`、`search_values`；Task 17 `run_sync`、`run_value_index`。
 - Produces（`text2sql.metadata.cli`）:
-  - `build_parser() -> argparse.ArgumentParser`（子命令：`sync`、`snapshots`、`show [--snapshot ID|latest] [--table NAME]`、`flagged [--snapshot]`、`review-comment --type --key --decision --reviewer [--note]`、`release create [--snapshot] --by [--note]`、`release activate ID --by --reason`、`release show [ID|active]`）
-  - `format_snapshot(SchemaSnapshot) -> list[str]`、`format_table(TableInfo) -> list[str]`
+  - `build_parser() -> argparse.ArgumentParser`（子命令：`sync`、`snapshots`、`show [--snapshot ID|latest] [--table NAME]`、`flagged [--snapshot]`、`review-comment --type --key --decision --reviewer [--note]`、`release create [--snapshot] --by [--note]`、`release activate ID --by --reason`、`release show [ID|active]`、`structure [--snapshot]`、`values build [--include KEY ...] [--exclude KEY ...]`、`values show`、`values search TEXT [--tenant KEY]`）
+  - `format_snapshot(SchemaSnapshot) -> list[str]`、`format_table(TableInfo) -> list[str]`、`format_structure(StructureSummary) -> list[str]`
+  - `values show` 每列一行 `"  {key:<48} {reason or 'INDEXED':<16} values={count}"`；`values search` 每个命中一行 `"{score:.2f} {exact|fuzzy} {key} {value}"`；没有构建时 `values show/search` 报 `VALUE_INDEX_NOT_FOUND`
   - `main(argv: Sequence[str] | None = None) -> int`：成功 0；`AppError` 打印 `error <CODE>: <message>` 到 stderr，返回 1。每次运行设一个新 `trace_id`。
 
 集成测试把 `cli.configure_logging` 替换成空函数：真实的 `configure_logging` 会把根 logger 的 handler 换成写 `sys.stdout` 的 handler，在 pytest 里这个 handler 会指向 `capsys` 的临时流，测试结束后流被关闭，后面的测试一写日志就报 `I/O operation on closed file`。
@@ -5042,6 +6715,7 @@ import pytest
 from tests.metadata_factories import sample_tables
 from text2sql.metadata import cli
 from text2sql.metadata.snapshot import ColumnInfo, TableInfo, ViewInfo
+from text2sql.metadata.structure import StructureSummary, TableFamily
 
 
 def _table_info(index: int) -> TableInfo:
@@ -5105,6 +6779,29 @@ def test_format_table_hides_unavailable_view_definition() -> None:
         }
     )
     assert cli.format_table(view)[-1] == "view definition: <hidden>"
+
+
+def test_parser_values_commands() -> None:
+    parser = cli.build_parser()
+    build = parser.parse_args(["values", "build", "--exclude", "t.a", "t.b"])
+    assert (build.values_command, build.include, build.exclude) == ("build", [], ["t.a", "t.b"])
+    search = parser.parse_args(["values", "search", "华东", "--tenant", "1001"])
+    assert (search.text, search.tenant) == ("华东", "1001")
+    assert parser.parse_args(["values", "search", "x"]).tenant is None
+    assert parser.parse_args(["structure"]).snapshot == "latest"
+
+
+def test_format_structure() -> None:
+    summary = StructureSummary(
+        families=(TableFamily("t_order", "t_order", ("t_order", "t_order_2024")),),
+        common_columns=("created_at", "deleted"),
+    )
+    assert cli.format_structure(summary) == [
+        "families=1",
+        "  t_order                          representative=t_order members=2: "
+        "t_order, t_order_2024",
+        "common columns: created_at, deleted",
+    ]
 ```
 
 - [ ] **Step 2: Write the failing integration tests**
@@ -5190,6 +6887,39 @@ def test_errors_are_reported_with_code(
     _run(capsys, "sync")
     code, _, err = _run(capsys, "show", "--table", "missing")
     assert (code, "error METADATA_OBJECT_NOT_FOUND" in err) == (1, True)
+
+
+def test_structure_and_values_commands(
+    metadata_db: Engine, mysql_fixture: MysqlFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = _run(capsys, "values", "show")
+    assert (code, err.strip()) == (
+        1,
+        f"error VALUE_INDEX_NOT_FOUND: no value index for {mysql_fixture.datasource_id}",
+    )
+    mysql_fixture.execute(
+        "INSERT INTO t_customer (id, tenant_id, code, name) "
+        "VALUES (1, 1001, 'C1', '华东精密有限公司')"
+    )
+    mysql_fixture.execute("CREATE TABLE t_customer_bak LIKE t_customer")
+    assert _run(capsys, "sync")[0] == 0
+
+    code, out, _ = _run(capsys, "structure")
+    assert code == 0
+    assert "representative=t_customer members=2: t_customer, t_customer_bak" in out
+
+    code, out, _ = _run(capsys, "values", "build", "--exclude", "t_customer_bak.name")
+    assert code == 0
+    assert "indexed_columns=1" in out and "values=1" in out
+
+    code, out, _ = _run(capsys, "values", "show")
+    assert "t_customer.name" in out and "INDEXED" in out
+    assert "t_customer_bak.name" in out and "EXCLUDED" in out
+
+    code, out, _ = _run(capsys, "values", "search", "华东精密", "--tenant", "1001")
+    assert "fuzzy t_customer.name" in out and "华东精密有限公司" in out
+    code, out, _ = _run(capsys, "values", "search", "华东精密", "--tenant", "1002")
+    assert (code, out) == (0, "")
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -5215,14 +6945,16 @@ from text2sql.common.errors import (
     METADATA_OBJECT_NOT_FOUND,
     METADATA_SNAPSHOT_NOT_FOUND,
     RELEASE_NOT_FOUND,
+    VALUE_INDEX_NOT_FOUND,
     AppError,
 )
 from text2sql.common.logging import configure_logging
 from text2sql.common.tracing import new_trace_id, reset_trace_id, set_trace_id
 from text2sql.db.system import session_scope
 from text2sql.metadata.catalog.repository import latest_snapshot_id, list_snapshots, load_snapshot
+from text2sql.metadata.catalog.value_store import latest_value_build, search_values, value_columns
 from text2sql.metadata.comment_review import record_review, review_decision
-from text2sql.metadata.jobs import run_sync
+from text2sql.metadata.jobs import run_sync, run_value_index
 from text2sql.metadata.release import (
     activate_release,
     create_release,
@@ -5230,6 +6962,7 @@ from text2sql.metadata.release import (
     get_release,
 )
 from text2sql.metadata.snapshot import SchemaSnapshot, TableInfo
+from text2sql.metadata.structure import StructureSummary, summarize_structure
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5265,6 +6998,19 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--reason", required=True)
     show_release = release_commands.add_parser("show")
     show_release.add_argument("release", nargs="?", default="active", help="id or 'active'")
+
+    structure = commands.add_parser("structure", help="table families and common columns")
+    structure.add_argument("--snapshot", default="latest")
+
+    values = commands.add_parser("values", help="build, show or search the value index")
+    values_commands = values.add_subparsers(dest="values_command", required=True)
+    build = values_commands.add_parser("build")
+    build.add_argument("--include", nargs="*", default=[], help="table.column keys")
+    build.add_argument("--exclude", nargs="*", default=[], help="table.column keys")
+    values_commands.add_parser("show")
+    search = values_commands.add_parser("search")
+    search.add_argument("text")
+    search.add_argument("--tenant", default=None, help="tenant key; omit for untenanted tables")
     return parser
 
 
@@ -5327,6 +7073,41 @@ def format_table(table: TableInfo) -> list[str]:
     return lines
 
 
+def format_structure(summary: StructureSummary) -> list[str]:
+    lines = [f"families={len(summary.families)}"]
+    for family in summary.families:
+        lines.append(
+            f"  {family.stem:<32} representative={family.representative} "
+            f"members={len(family.members)}: {', '.join(family.members)}"
+        )
+    lines.append(f"common columns: {', '.join(summary.common_columns) or '-'}")
+    return lines
+
+
+def _values(session: Session, datasource_id: str, args: argparse.Namespace) -> list[str]:
+    build = latest_value_build(session, datasource_id)
+    if build is None:
+        raise AppError(VALUE_INDEX_NOT_FOUND, f"no value index for {datasource_id}", 404)
+    if args.values_command == "show":
+        lines = [
+            f"build {build.build_id}  snapshot={build.snapshot_id}  "
+            f"indexed={build.indexed_column_count} skipped={build.skipped_column_count} "
+            f"values={build.value_count}  created_at={build.created_at.isoformat()}"
+        ]
+        lines += [
+            f"  {key:<48} {reason or 'INDEXED':<16} values={count}"
+            for key, reason, count in value_columns(session, build.build_id)
+        ]
+        return lines
+    hits = search_values(
+        session, datasource_id=datasource_id, text_value=args.text, tenant_key=args.tenant
+    )
+    return [
+        f"{h.score:.2f} {'exact' if h.exact else 'fuzzy':<5} {h.column_key:<40} {h.value}"
+        for h in hits
+    ]
+
+
 def _comment_of(snapshot: SchemaSnapshot, object_type: str, key: str) -> str:
     if object_type == "TABLE":
         table = snapshot.table(key)
@@ -5349,6 +7130,13 @@ def _run(args: argparse.Namespace) -> list[str]:
             f"tables={result.table_count} columns={result.column_count} "
             f"flagged_comments={result.flagged_comment_count}"
         ]
+    if args.command == "values" and args.values_command == "build":
+        built = run_value_index("cli", include=args.include, exclude=args.exclude)
+        return [
+            f"build_id={built.build_id} snapshot_id={built.snapshot_id} "
+            f"indexed_columns={built.indexed_column_count} "
+            f"skipped_columns={built.skipped_column_count} values={built.value_count}"
+        ]
     with session_scope() as session:
         if args.command == "snapshots":
             return [
@@ -5366,6 +7154,13 @@ def _run(args: argparse.Namespace) -> list[str]:
             if table is None:
                 raise AppError(METADATA_OBJECT_NOT_FOUND, f"table {args.table} not found", 404)
             return format_table(table)
+        if args.command == "structure":
+            snapshot = load_snapshot(
+                session, _resolve_snapshot(session, datasource_id, args.snapshot)
+            )
+            return format_structure(summarize_structure(snapshot.tables))
+        if args.command == "values":
+            return _values(session, datasource_id, args)
         if args.command == "flagged":
             snapshot = load_snapshot(
                 session, _resolve_snapshot(session, datasource_id, args.snapshot)
@@ -5459,24 +7254,29 @@ if __name__ == "__main__":
 - [ ] **Step 6: Run unit tests**
 
 Run: `uv run pytest tests/unit/metadata/test_cli.py -v`
-Expected: `4 passed`。
+Expected: `6 passed`。
 
 - [ ] **Step 7: Run integration tests**
 
 Run: `set -a && source .env && set +a && uv run pytest -m integration tests/integration/metadata/test_cli.py -v`
-Expected: `4 passed`。
+Expected: `6 passed`（3 个用例 × mysql57/mysql80）。
 
 - [ ] **Step 8: Try it by hand (acceptance 11)**
 
 Run: `uv run alembic upgrade head && uv run python -m text2sql.metadata sync && uv run python -m text2sql.metadata show && uv run python -m text2sql.metadata show --table _t2s_probe`
 Expected: `sync` 打印 `snapshot_id=<N> unchanged=false tables=1 columns=2 flagged_comments=0`（t2s_business 里只有 `_t2s_probe`）（前后有 JSON 日志行）；`show` 列出 `_t2s_probe`；`show --table _t2s_probe` 打印 `id`/`note` 两列、`PRIMARY` 索引、空的外键段。再跑一次 `sync` 应为 `unchanged=true`。
 
-- [ ] **Step 9: Quality gates**
+- [ ] **Step 9: Try structure and values by hand (acceptance 13, 15)**
+
+Run: `uv run python -m text2sql.metadata structure && uv run python -m text2sql.metadata values build && uv run python -m text2sql.metadata values show`
+Expected: `structure` 打印 `families=0` 和 `common columns: -`（只有一张表）；`values build` 打印 `build_id=<N> snapshot_id=<M> indexed_columns=0 skipped_columns=1 values=0`；`values show` 列出 `_t2s_probe.note` 的跳过原因 `NO_TENANT_KEY`（`_t2s_probe` 没有 `tenant_id`）。单租户库可以设 `T2S_VALUE_INDEX_TENANT_COLUMN=` 再 `values build`，此时 `note` 被索引，`values search probe` 打印 `1.00 exact _t2s_probe.note … probe`（列宽对齐）。
+
+- [ ] **Step 10: Quality gates**
 
 Run: `uv run ruff format . && uv run ruff check . && uv run mypy && uv run pytest`
 Expected: `N files left unchanged`（或 reformatted 后再跑一次无变化）、`All checks passed!`、`Success: no issues found in N source files`、全部单元测试通过。
 
-- [ ] **Step 10: Commit and push**
+- [ ] **Step 11: Commit and push**
 
 ```bash
 git add src/text2sql/metadata/__main__.py src/text2sql/metadata/cli.py tests/unit/metadata/test_cli.py tests/integration/metadata/test_cli.py
@@ -5486,7 +7286,7 @@ git push origin main
 
 ---
 
-### Task 15: 文档与整体验收（验收 1–12）
+### Task 19: 文档与整体验收（验收 1–16）
 
 **Files:**
 - Modify: `README.md`（在「本地开发」末尾追加小节）、`AGENTS.md`（状态行 + 命令）
@@ -5513,9 +7313,17 @@ Append to `README.md`:
    uv run python -m text2sql.metadata release create --by <名字>
    uv run python -m text2sql.metadata release activate <ID> --by <名字> --reason <原因>   # T2S_ENV=prod 时拒绝
    uv run python -m text2sql.metadata release show
+   uv run python -m text2sql.metadata structure               # 表族（分表/备份表）与公共列
    ```
-3. 也可以入队让 worker 执行：任务类型 `metadata.sync`，payload `{"datasource_id": "<与 T2S_DATASOURCE_ID 相同>", "requested_by": "<名字>"}`。
-4. 元数据集成测试会用 root 账号建临时库 `t2s_meta_fixture`，需要 `.env` 里有 `T2S_TEST_MYSQL57_ADMIN_URL`、`T2S_TEST_MYSQL80_ADMIN_URL`（见 `.env.example`），未设置时这些测试跳过。
+3. 值索引（低基数文本列的 distinct 值，按租户存储，供实体值匹配）：
+   ```bash
+   uv run python -m text2sql.metadata values build [--include 表.列 ...] [--exclude 表.列 ...]   # 基于最新快照，扫业务库
+   uv run python -m text2sql.metadata values show             # 每列是否索引、跳过原因、值数
+   uv run python -m text2sql.metadata values search 华东 --tenant 1001
+   ```
+   默认只收有 `tenant_id` 列的表；单租户库设 `T2S_VALUE_INDEX_TENANT_COLUMN=`（空）。其他上限见 `docs/specs/02-metadata.md` 4.1。
+4. 也可以入队让 worker 执行：任务类型 `metadata.sync` 或 `metadata.value_index`，payload `{"datasource_id": "<与 T2S_DATASOURCE_ID 相同>", "requested_by": "<名字>"}`（值索引可加 `"include"` / `"exclude"` 列表）。
+5. 元数据集成测试会用 root 账号建临时库 `t2s_meta_fixture`，需要 `.env` 里有 `T2S_TEST_MYSQL57_ADMIN_URL`、`T2S_TEST_MYSQL80_ADMIN_URL`（见 `.env.example`），未设置时这些测试跳过。
 ````
 
 - [ ] **Step 2: Modify `AGENTS.md`**
@@ -5523,13 +7331,13 @@ Append to `README.md`:
 把 Project 小节的状态行改为：
 
 ```markdown
-**Status: Specs 01 (foundation) and 02 (metadata catalog) implemented.** Config, logging/trace ids, the API skeleton, system and read-only business DB access, the PostgreSQL job queue and worker, a temporary LangGraph echo route, and the metadata catalog (MySQL collector, immutable snapshots, object identities, comment review, releases with a release pointer, STALE marks, `python -m text2sql.metadata` CLI and the `metadata.sync` job) exist. Further code follows the 6-week MVP plan in `docs/architecture.md` (chapter 23) and the sub-project specs.
+**Status: Specs 01 (foundation) and 02 (metadata catalog) implemented.** Config, logging/trace ids, the API skeleton, system and read-only business DB access, the PostgreSQL job queue and worker, a temporary LangGraph echo route, and the metadata catalog (MySQL collector, immutable snapshots, object identities, comment review, releases with a release pointer, STALE marks, table families, a tenant-scoped `pg_trgm` value index, `python -m text2sql.metadata` CLI and the `metadata.sync` / `metadata.value_index` jobs) exist. Further code follows the 6-week MVP plan in `docs/architecture.md` (chapter 23) and the sub-project specs.
 ```
 
 在 "Testing and evaluation" 的 Commands 列表里，`Integration tests:` 那一行后面加一条：
 
 ```markdown
-  - Metadata: `uv run python -m text2sql.metadata sync|snapshots|show|flagged|review-comment|release ...`; metadata integration tests also need `T2S_TEST_MYSQL57_ADMIN_URL` / `T2S_TEST_MYSQL80_ADMIN_URL` (root, used only to create the `t2s_meta_fixture` database)
+  - Metadata: `uv run python -m text2sql.metadata sync|snapshots|show|flagged|review-comment|release|structure|values ...`; metadata integration tests also need `T2S_TEST_MYSQL57_ADMIN_URL` / `T2S_TEST_MYSQL80_ADMIN_URL` (root, used only to create the `t2s_meta_fixture` database)
 ```
 
 - [ ] **Step 3: Full acceptance run**
@@ -5548,6 +7356,10 @@ Append to `README.md`:
 10. `tests/unit/metadata/test_snapshot.py::test_versions_below_5_7_8_are_rejected`、`test_collector_build.py::test_old_versions_rejected`。
 11. 手动：`uv run python -m text2sql.metadata sync && uv run python -m text2sql.metadata show --table _t2s_probe` → 打印字段、索引、外键段和注释标记。
 12. `uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest && set -a && source .env && set +a && uv run pytest -m integration` → 全部通过，集成测试摘要里**没有 skipped**（所有 `T2S_TEST_*` 都已设置）。
+13. `tests/unit/metadata/test_structure.py`（表族、代表表、不入族的情形、公共列）；手动：`uv run python -m text2sql.metadata structure`。
+14. `tests/unit/metadata/test_value_index.py`（各跳过原因、include/exclude 优先级）。
+15. `tests/integration/metadata/test_collector_values.py`（5.7、8.0 各一次）、`tests/unit/metadata/test_collector_values.py`、`test_sync.py::test_value_index_job_builds_from_latest_snapshot`、`tests/integration/metadata/test_cli.py::test_structure_and_values_commands`。
+16. `test_value_store.py`（精确 + 模糊、按租户隔离、只留 2 次构建）、`tests/integration/test_migrations.py`（`pg_trgm` 已安装、3 张值索引表随 0002 建出和回滚）。
 
 - [ ] **Step 4: Commit and push**
 
@@ -5569,12 +7381,14 @@ git push origin main
 | M2 采集器（表、视图、字段、索引、PK/UK、FK、注释、行数估计；5.7/8.0；版本门槛；规模上限；跨库外键忽略；无 `SHOW VIEW`） | 5、6 |
 | M3 不可变快照（规范化存储、哈希去重、触发器、只有插入函数、仓库四个接口） | 4、7、9 |
 | M4 对象身份（自然键 + UUID、退役、重建换新 UUID、部分唯一索引） | 7、8、9 |
-| M5 注入检测与复核（6 条规则、`comment_flags`、`record_review`、`comment_visible`） | 3、5、10、14（`flagged`、`review-comment`） |
-| M6 Release 与指针（预留列、组件不可改、`move_pointer` 事务性切换、事件、prod 拒绝） | 7、11、14 |
+| M5 注入检测与复核（6 条规则、`comment_flags`、`record_review`、`comment_visible`） | 3、5、10、18（`flagged`、`review-comment`） |
+| M6 Release 与指针（预留列、组件不可改、`move_pointer` 事务性切换、事件、prod 拒绝） | 7、11、18 |
 | M7 STALE 存储（部分唯一、重复标记追加、`StaleSet`、不缓存） | 7、12 |
-| M8 CLI 全部子命令；队列 `metadata.sync`；不可重试错误；开始/结束日志 | 13、14 |
-| 4.1 `T2S_DATASOURCE_ID`、`.env.example` 用 `local_mysql80`、`METADATA_NO_DATABASE` | 2、5 |
-| §5 验收 1–12 | 15（Step 3 逐条映射到测试） |
+| M8 CLI 全部子命令；队列 `metadata.sync`；不可重试错误；开始/结束日志 | 17、18 |
+| M9 表族与公共列（同词干 + 同列签名、代表表、公共列阈值、不进哈希；CLI `structure`） | 13、18 |
+| M10 值索引（选列规则与跳过原因、有界采集、超时、3 张表与 `pg_trgm`、保留 2 次构建、按租户精确 + 模糊检索、队列 `metadata.value_index`、CLI `values`、`VALUE_INDEX_NOT_FOUND`） | 2、7、14、15、16、17、18 |
+| 4.1 `T2S_DATASOURCE_ID`、`value_index_*`、`.env.example` 用 `local_mysql80`、`METADATA_NO_DATABASE` | 2、5 |
+| §5 验收 1–16 | 19（逐条映射到测试） |
 | §6 无新增依赖 | Global Constraints |
 
 ### 2. Placeholder scan
@@ -5583,12 +7397,16 @@ git push origin main
 
 ### 3. Type and name consistency
 
-- `SnapshotData` / `SchemaSnapshot` / `TableData` / `TableInfo` / `ColumnData` / `ColumnInfo`（4）→ 采集器（5）、仓库（9）、`run_sync`（13）、CLI（14）同名使用。
+- `SnapshotData` / `SchemaSnapshot` / `TableData` / `TableInfo` / `ColumnData` / `ColumnInfo`（4）→ 采集器（5）、仓库（9）、表族（13）、值索引规则（14）、`run_sync`（17）、CLI（18）同名使用。
 - `snapshot_content_hash`、`table_content_hash`、`column_content_hash`（4）→ 仓库（9）。
 - `ObjectType`（4）→ `stale.py`（12）；`IdentityKey`、`column_key`、`assign_identities(session, *, datasource_id, snapshot_id, keys)`（8）→ 仓库（9）。
 - ORM 列 `collation_name`（7）↔ 模型字段 `collation`（4），转换只发生在 `repository.py`（9）。
-- `SaveResult(snapshot_id, unchanged)`（9）→ `run_sync`（13）及其单元测试替身。
-- `review_decision` / `comment_visible` / `record_review`（10）→ CLI（14）、`test_sync.py`（13）。
-- `create_release` / `activate_release` / `get_active_release_id` / `get_release` / `move_pointer`（11）→ CLI（14）。
-- `SYNC_KIND = "metadata.sync"`、`run_sync(requested_by)`、`handle_sync(payload)`（13）→ CLI（14）、`HANDLER_MODULES`（13）。
-- Fixtures：`mysql_target`、`require_env`、`MYSQL_TARGETS`、`migrated_db`（Spec 01）→ `mysql_fixture`（6）、`metadata_db`（7），在 8–14 中同名使用。
+- `SaveResult(snapshot_id, unchanged)`（9）→ `run_sync`（17）及其单元测试替身。
+- `review_decision` / `comment_visible` / `record_review`（10）→ CLI（18）、`test_sync.py`（17）。
+- `create_release` / `activate_release` / `get_active_release_id` / `get_release` / `move_pointer`（11）→ CLI（18）。
+- `SYNC_KIND = "metadata.sync"`、`run_sync(requested_by)`、`handle_sync(payload)`（17）→ CLI（18）、`HANDLER_MODULES`（17）。
+- `ColumnDecision`、`SkipReason`、`plan_value_columns`、`normalize_value`、`query_terms`（14）→ `collect_values`（15）、`save_value_build` / `search_values`（16）、`run_value_index`（17）。
+- `CollectedColumn`（15）→ `save_value_build`（16）；`ValueHit(column_key, value, score, exact)`、`search_values(session, *, datasource_id, text_value, tenant_key, …)`（16）→ CLI `values search`（18）；同名接口被 Spec 08 A3/A5 引用。
+- `VALUE_INDEX_KIND = "metadata.value_index"`、`run_value_index(requested_by, *, include, exclude)`（17）→ CLI `values build`（18）；Spec 09 的 `sync_and_diff` 以后入队同一任务。
+- 表名 `metadata_value_build` / `metadata_value_column` / `metadata_value`、配置 `value_index_*`、跳过原因码与 spec 4.1 / 4.11 一字不差。
+- Fixtures：`mysql_target`、`require_env`、`MYSQL_TARGETS`、`migrated_db`（Spec 01）→ `mysql_fixture`（6）、`metadata_db`（7），在 8–18 中同名使用。
