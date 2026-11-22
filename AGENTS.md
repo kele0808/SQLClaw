@@ -12,6 +12,7 @@ A production-grade Text2SQL Agent: users ask questions in natural language (most
 
 - `docs/architecture.md` — the revised architecture spec (Chinese). **This is authoritative.** Read the relevant chapter before implementing a module. Lines marked `修订：` are deliberate changes from the original; follow them.
 - `docs/spec-original.md` — the original spec, kept for reference only. Do not implement from it where it conflicts with `architecture.md`.
+- `docs/research/` — dated research notes (Chinese) on industry systems and papers, with proposals for our specs. Not authoritative: a proposal applies only once it is written into `architecture.md` or a spec. Check it before redesigning retrieval, the semantic layer, or evaluation.
 - `docs/learning/` — study notes (Chinese) explaining tricky parts of the implementation. Not authoritative; update them when the code they explain changes.
 - If code and the spec disagree, stop and flag it rather than silently picking one. If you change a design decision, update `docs/architecture.md` in the same change.
 

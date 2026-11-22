@@ -57,6 +57,7 @@ uv run mypy            # 类型检查
 
 - [架构方案（修订版）](docs/architecture.md)：当前以此为准，含审阅修订说明。
 - [原始方案](docs/spec-original.md)：修订前的原文，保留作对照。
+- [调研笔记](docs/research/README.md)：业界实现与论文调研（如[多表 / 大 Schema 场景的 Text2SQL 前沿](docs/research/01-text2sql-sota.md)），仅供参考，以架构方案和 spec 为准。
 - [AGENTS.md](AGENTS.md)：给 AI 编码助手的项目约定（`CLAUDE.md` 引用同一份）。
 
 ## 规划中的目录结构
