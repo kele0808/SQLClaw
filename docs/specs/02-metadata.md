@@ -1,6 +1,6 @@
 # Spec 02：Metadata 元数据目录
 
-- 状态：已确认（2026-11-20）
+- 状态：已确认（2026-11-20）；按 docs/plans/02-metadata.md「待确认」修订（2026-11-22）
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 3、5）。新增 M9「表族与公共列」（只派生、不存储）和 M10「值索引」（离线 distinct 值 + PG `pg_trgm` 模糊匹配，供 Spec 05/08 实体解析先查）；4.1 加值索引配置；4.9 加子命令与队列任务 `metadata.value_index`；验收追加 13–16。两项都属于 **MVP**（第 1 周随 Spec 02 实现），原因：成本低，且 Spec 03 的干扰表压测和 Spec 08 的实体解析依赖它们。
@@ -104,8 +104,8 @@ def collect_snapshot(engine: Engine, datasource_id: str) -> SnapshotData: ...
 3. 表：`information_schema.TABLES`（`TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COMMENT, TABLE_ROWS`），`TABLE_SCHEMA = DATABASE()`。
 4. 字段：`information_schema.COLUMNS`（`COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA, COLUMN_COMMENT, CHARACTER_SET_NAME, COLLATION_NAME, GENERATION_EXPRESSION`）。
 5. 索引：`information_schema.STATISTICS`（`INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE`），按 `SEQ_IN_INDEX` 组装有序列表。`PRIMARY` 为主键。
-6. 外键：`KEY_COLUMN_USAGE` 关联 `REFERENTIAL_CONSTRAINTS`，只保留引用同库表的外键（跨库外键记录日志后忽略，MVP 不支持跨库）。
-7. 视图：`information_schema.VIEWS`（`VIEW_DEFINITION, CHECK_OPTION, SECURITY_TYPE`）。账号无 `SHOW VIEW` 权限时定义为空串，记 `definition_available = false`，不报错。
+6. 外键：`KEY_COLUMN_USAGE` 关联 `REFERENTIAL_CONSTRAINTS`，只保留引用同库表的外键（跨库外键记录日志后忽略，MVP 不支持跨库）。查询用 LEFT JOIN `REFERENTIAL_CONSTRAINTS`：账号看不到该视图时外键仍被采集，`ON UPDATE` / `ON DELETE` 记为空串。
+7. 视图：`information_schema.VIEWS`（`VIEW_DEFINITION, CHECK_OPTION, SECURITY_TYPE`）。账号无 `SHOW VIEW` 权限时定义为空串，记 `definition_available = false`，不报错。`VIEWS` 中没有该视图的行时同样处理。视图在 `TABLES` 中的 `TABLE_COMMENT` 固定为字面量 `"VIEW"`，归一为空串；`GENERATION_EXPRESSION` 为空串时记为 null。
 8. 派生字段：`is_primary`（字段属于 PRIMARY）、`is_unique`（字段**单独**构成某个唯一索引）。复合唯一约束只记录在索引上，Spec 04 按列集合判定唯一性。
 9. 每个表、字段的注释交给 `prompt_guard.scan_text()`，结果写入 `comment_flags`。
 
@@ -124,7 +124,7 @@ def collect_snapshot(engine: Engine, datasource_id: str) -> SnapshotData: ...
 | `database_name` | `VARCHAR(128)` | 非空 |
 | `server_version` | `VARCHAR(64)` | 最近一次采集值 |
 | `sql_mode` / `time_zone` / `system_time_zone` | `TEXT` / `VARCHAR(64)` / `VARCHAR(64)` | 最近一次采集值 |
-| `character_set` / `collation` | `VARCHAR(64)` | 最近一次采集值 |
+| `character_set` / `collation_name` | `VARCHAR(64)` | 最近一次采集值 |
 | `lower_case_table_names` | `SMALLINT` | 最近一次采集值 |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | 非空 |
 
@@ -139,24 +139,26 @@ def collect_snapshot(engine: Engine, datasource_id: str) -> SnapshotData: ...
 | `database_name` | `VARCHAR(128)` | 非空 |
 | `server_version` | `VARCHAR(64)` | 非空，原文 |
 | `version_major` / `version_minor` / `version_patch` | `SMALLINT` | 非空 |
-| `sql_mode` / `time_zone` / `system_time_zone` / `character_set` / `collation` | 同上 | 非空 |
+| `sql_mode` / `time_zone` / `system_time_zone` / `character_set` / `collation_name` | 同上 | 非空 |
 | `lower_case_table_names` | `SMALLINT` | 非空 |
 | `content_hash` | `CHAR(64)` | 非空，见下 |
 | `table_count` / `column_count` | `INT` | 非空 |
 | `collected_at` | `TIMESTAMPTZ` | 非空 |
 | `trace_id` | `VARCHAR(64)` | 可空 |
 
-唯一约束 `(datasource_id, content_hash)`。
+普通索引 `(datasource_id, content_hash)`，不设唯一约束（去重只和最新快照比较，见下）。
 
 **`metadata_table`**：`id` 主键；`snapshot_id` FK；`object_uuid UUID` 非空；`table_name VARCHAR(128)`；`table_type`（`BASE TABLE` / `VIEW`）；`engine`；`table_comment TEXT`；`comment_flags TEXT[]` 默认空；`row_estimate BIGINT` 可空；`content_hash CHAR(64)`。唯一 `(snapshot_id, table_name)`。
 
-**`metadata_column`**：`id`；`snapshot_id`；`table_id` FK；`object_uuid`；`column_name`；`ordinal_position INT`；`data_type`；`column_type`；`is_nullable BOOLEAN`；`default_value TEXT`；`extra TEXT`；`generation_expression TEXT`；`character_set`；`collation`；`column_comment TEXT`；`comment_flags TEXT[]`；`is_primary BOOLEAN`；`is_unique BOOLEAN`；`content_hash`。唯一 `(table_id, column_name)`。
+**`metadata_column`**：`id`；`snapshot_id`；`table_id` FK；`object_uuid`；`column_name`；`ordinal_position INT`；`data_type`；`column_type`；`is_nullable BOOLEAN`；`default_value TEXT`；`extra TEXT`；`generation_expression TEXT`；`character_set`；`collation_name`；`column_comment TEXT`；`comment_flags TEXT[]`；`is_primary BOOLEAN`；`is_unique BOOLEAN`；`content_hash`。唯一 `(table_id, column_name)`。
 
 **`metadata_index`**：`id`；`snapshot_id`；`table_id`；`index_name`；`is_primary`；`is_unique`；`columns TEXT[]`（有序）；`sub_parts INT[]`（前缀长度，可空元素）；`index_type`。唯一 `(table_id, index_name)`。
 
-**`metadata_foreign_key`**：`id`；`snapshot_id`；`table_id`；`constraint_name`；`columns TEXT[]`；`ref_table`；`ref_columns TEXT[]`；`on_update`；`on_delete`。
+**`metadata_foreign_key`**：`id`；`snapshot_id`；`table_id`；`constraint_name`；`columns TEXT[]`；`ref_table`；`ref_columns TEXT[]`；`on_update`；`on_delete`。唯一 `(table_id, constraint_name)`。
 
 **`metadata_view`**：`id`；`snapshot_id`；`table_id`（唯一）；`view_definition TEXT`；`definition_available BOOLEAN`；`check_option`；`security_type`。
+
+`collation` 是 PostgreSQL 保留字，所以三张表的列名用 `collation_name`；领域模型字段仍叫 `collation`。
 
 不可变性保证：
 
@@ -166,7 +168,7 @@ def collect_snapshot(engine: Engine, datasource_id: str) -> SnapshotData: ...
 内容哈希与去重：
 
 - `content_hash = sha256(canonical_json(SnapshotData 去掉 collected_at、row_estimate))`。canonical JSON：键排序、表按名排序、字段按 `ordinal_position`、索引按名、外键按约束名。`row_estimate` 不进哈希，原因是 `TABLE_ROWS` 每次都会波动，进哈希会导致每次采集都产生新快照。
-- 若该数据源已存在相同 `content_hash` 的快照，`sync` 不写新快照，直接返回已有快照 ID，结果标记 `unchanged = true`。
+- 若该数据源**最新一份**快照的 `content_hash` 相同，`sync` 不写新快照，返回该快照 ID，结果标记 `unchanged = true`。与更早的快照相同（结构 A→B→A）时照常写新快照：否则删除后重建的字段会落回旧快照、复用旧 UUID，与 4.5 和验收 5 矛盾。
 
 仓库接口（`text2sql.metadata.catalog.repository`）：
 
@@ -201,6 +203,8 @@ class ColumnInfo(BaseModel):
     default_value: str | None
     extra: str
     generation_expression: str | None
+    character_set: str | None
+    collation: str | None
     comment: str
     comment_flags: tuple[str, ...]
     is_primary: bool
@@ -213,20 +217,26 @@ class IndexInfo(BaseModel):
     is_unique: bool
     columns: tuple[str, ...]
     sub_parts: tuple[int | None, ...]
+    index_type: str
 
 class ForeignKeyInfo(BaseModel):
     name: str
     columns: tuple[str, ...]
     ref_table: str
     ref_columns: tuple[str, ...]
+    on_update: str
+    on_delete: str
 
 class ViewInfo(BaseModel):
     definition: str
     definition_available: bool
+    check_option: str
+    security_type: str
 
 class TableInfo(BaseModel):
     name: str
     table_type: Literal["BASE TABLE", "VIEW"]
+    engine: str | None
     comment: str
     comment_flags: tuple[str, ...]
     row_estimate: int | None
@@ -251,7 +261,7 @@ class SchemaSnapshot(BaseModel):
     def target_key(self) -> Literal["mysql57", "mysql80"]: ...      # 5.7.x → mysql57；8.0.x → mysql80；其他版本抛错
 ```
 
-`SnapshotData` 结构相同，但没有 `snapshot_id` 和 `object_uuid`（UUID 在保存时由 M4 分配）。
+采集结果用不带 UUID 的 `ColumnData` / `TableData`（`ColumnInfo`、`TableInfo` 分别继承它们并加 `object_uuid`）；`SnapshotData` 含 `datasource_id`、`database_name`、`server`、`collected_at`、`tables: tuple[TableData, ...]`，没有 `snapshot_id` 和 `content_hash`（UUID 在保存时由 M4 分配，哈希由 `snapshot_content_hash()` 计算）。`target_key()` 对 5.7/8.0 以外的版本抛 `METADATA_UNSUPPORTED_VERSION`。
 
 **对象键（object key）约定**，04～09 共用：
 
@@ -305,7 +315,7 @@ def comment_visible(session, *, datasource_id, object_type, object_key, comment:
                     flags: Sequence[str]) -> bool: ...
 ```
 
-`comment_visible` 规则：无标记 → `True`；有标记且存在同哈希 `ALLOW` 记录 → `True`；否则 `False`。Spec 08 构建模型上下文时只放 `comment_visible` 为真的注释；注释改动后哈希变化，需要重新复核。
+`comment_visible` 规则：无标记 → `True`；有标记且存在同哈希 `ALLOW` 记录 → `True`；否则 `False`。Spec 08 构建模型上下文时只放 `comment_visible` 为真的注释；注释改动后哈希变化，需要重新复核。同一对象同一注释哈希再次复核时覆盖旧决定（upsert）。
 
 ### 4.7 M6 Release 与发布指针
 
@@ -366,7 +376,7 @@ def move_pointer(session: Session, *, datasource_id: str, release_id: int,
 def activate_release(session: Session, release_id: int, *, actor: str, reason: str) -> None: ...
 ```
 
-- `move_pointer` 是唯一移动指针的函数：`SELECT … FOR UPDATE` 锁住指针行（不存在则插入），校验 release 属于同一数据源且状态不是 `REJECTED`，更新指针、写事件、把目标 release 置为 `PUBLISHED`，全部在调用方的同一事务内（架构 5.5 的"事务性切换"）。
+- `move_pointer` 是唯一移动指针的函数：先 `SELECT … FOR UPDATE` 锁住 `metadata_datasource` 行（指针行首次插入前也能让并发调用排队），再读取并更新或插入指针行，校验 release 属于同一数据源且状态不是 `REJECTED`，更新指针、写事件、把目标 release 置为 `PUBLISHED`，全部在调用方的同一事务内（架构 5.5 的"事务性切换"）。
 - `activate_release` = `move_pointer(action="ACTIVATE")`，**不做门禁**，用于第 1～5 周开发和评测。`Settings.env == "prod"` 时抛出 `AppError("RELEASE_GATE_REQUIRED", …, 409)`，生产只能走 Spec 09 的带门禁发布与回滚。
 - 每个查询在开始时读取一次 `get_active_release_id()` 并在整个查询中固定使用（架构 5.5），由 Spec 08 实现。
 
@@ -431,6 +441,8 @@ def load_open_stale(session: Session, datasource_id: str) -> StaleSet: ...
 日志：采集开始、结束各一条，字段含 `datasource_id`、`snapshot_id`、`unchanged`、`elapsed_ms`、`trace_id`。
 
 值索引队列：`@register("metadata.value_index")`，payload `{"datasource_id": str, "requested_by": str, "include"?: [str], "exclude"?: [str]}`，`datasource_id` 校验同上。MVP 由人在 `sync` 后执行 `values build`；Spec 09 的 `sync_and_diff` 在结构变化后自动入队。
+
+worker 启动时导入 `text2sql.jobs.worker.HANDLER_MODULES` 中列出的模块完成 handler 注册（本 Spec 加入 `text2sql.metadata.jobs`，它同时注册 `metadata.sync` 和 `metadata.value_index`）。
 
 ### 4.10 M9 表族与公共列
 
@@ -530,10 +542,27 @@ def search_values(session, *, datasource_id: str, text_value: str, tenant_key: s
 
 **MVP / 阶段 2**：MVP 做上述规则、构建、精确 + 模糊检索、CLI 和队列任务。阶段 2：同义词/拼音、embedding 召回、增量构建、按列的刷新频率、值频次排序。
 
+### 4.12 错误码
+
+| 错误码 | HTTP 状态（Spec 09 暴露接口时使用） | 场景 |
+| --- | --- | --- |
+| `METADATA_NO_DATABASE` | 422 | `business_db_url` 没有默认库 |
+| `METADATA_UNSUPPORTED_VERSION` | 422 | 版本低于 5.7.8、无法解析，或 `target_key()` 遇到 5.7/8.0 以外的版本 |
+| `METADATA_TOO_LARGE` | 422 | 超过 2000 表或 50000 字段 |
+| `METADATA_SNAPSHOT_NOT_FOUND` | 404 | 快照 ID 不存在，或数据源还没有快照 |
+| `METADATA_OBJECT_NOT_FOUND` | 404 | CLI 指定的表/字段不在快照中 |
+| `RELEASE_NOT_FOUND` | 404 | release 不存在，或数据源没有活跃 release |
+| `RELEASE_INVALID` | 409 | release/快照不属于该数据源，或 release 已 `REJECTED` |
+| `RELEASE_GATE_REQUIRED` | 409 | `T2S_ENV=prod` 时调用不带门禁的激活 |
+| `STALE_MARK_NOT_FOUND` | 404 | 解决一个不存在或已解决的 STALE 标记 |
+| `VALUE_INDEX_NOT_FOUND` | 404 | 数据源还没有值索引构建（CLI `values show` / `values search`） |
+
+4.11 里 `run_value_index` 在数据源没有快照时抛 `METADATA_SNAPSHOT_NOT_FOUND`（不另设错误码）；值采集超时不是错误，记为该列的 `TIMEOUT` 跳过原因。
+
 ## 5. 验收标准
 
 1. `uv run alembic upgrade head` 创建本 Spec 的全部表与触发器；`downgrade` 到 `0001` 可回滚。
-2. 对 `mysql57` 与 `mysql80` 分别执行 `sync`（集成测试，使用 Spec 03 的合成库；03 未就绪前使用测试内建的 3 张表夹具，含复合唯一索引、外键、视图、带注入文本的注释）：快照中的表、字段、PK、唯一索引、外键与夹具定义逐项一致；`server.version` 主版本分别为 5.7 与 8.0；`sql_mode`、`time_zone`、字符集、`lower_case_table_names` 非空。
+2. 对 `mysql57` 与 `mysql80` 分别执行 `sync`（集成测试，使用 Spec 03 的合成库；03 未就绪前使用测试内建的 3 张表夹具，含复合唯一索引、外键、视图、带注入文本的注释；夹具由 root 账号（`T2S_TEST_MYSQL57_ADMIN_URL` / `T2S_TEST_MYSQL80_ADMIN_URL`）在独立库 `t2s_meta_fixture` 中创建，并授予 `t2s_ro` SELECT；不改动 `t2s_business`）：快照中的表、字段、PK、唯一索引、外键与夹具定义逐项一致；`server.version` 主版本分别为 5.7 与 8.0；`sql_mode`、`time_zone`、字符集、`lower_case_table_names` 非空。
 3. 结构不变时连续两次 `sync`，第二次返回同一 `snapshot_id` 且 `unchanged = true`；仅 `TABLE_ROWS` 变化也不产生新快照。
 4. 对快照表执行 `UPDATE` 或 `DELETE` 被触发器拒绝（集成测试）。
 5. 新增一列后 `sync` 产生新快照：未变化的表与字段 `object_uuid` 不变；删除一列再加回同名列，新列 `object_uuid` 与原来不同。
