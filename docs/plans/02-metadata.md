@@ -6558,6 +6558,8 @@ git push origin main
 
 ### Task 17: 同步与值索引服务、队列任务 `metadata.sync` / `metadata.value_index`（M8 队列部分、M10，验收 2、3、5、6、15 端到端）
 
+> **前置（2026-11-24）：** 开始本任务之前，先完成 Spec 01 §4.6 新增的「租约续约与心跳」（`renew_lease`、worker 心跳线程、`attempts` 领取令牌、`job_heartbeat_s`）。它是 Spec 01 的补丁，单独作为一个任务实现和提交，不并入本任务。原因：`metadata.value_index` 可能运行超过 `job_lease_s`（300 秒），没有续约时会被另一个 worker 重复领取。`run_value_index` 在每列之间检查 `current_job_lease_lost()`。
+
 **Files:**
 - Create: `src/text2sql/metadata/jobs.py`
 - Modify: `src/text2sql/jobs/worker.py`

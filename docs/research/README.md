@@ -10,6 +10,8 @@
 | --- | --- | --- | --- |
 | [01-text2sql-sota.md](01-text2sql-sota.md) | 2026-11-22 | 多表 / 大 Schema 场景的 Text2SQL 前沿（WrenAI、supersonic、CHESS、Uber QueryGPT、LinkedIn SQL Bot、Spider 2.0、BEAVER 等），以及对 spec 02–08 的修改建议 | 5 条建议全部采纳：architecture 修订说明第 9 条、24 章「调研采纳与不采纳」；spec 02/03/04/05/06/08/09 的 2026-11-22 修订 |
 | [02-value-index-large-tables.md](02-value-index-large-tables.md) | 2026-11-22 | 值索引在大表上怎么采：CHESS、CodeS、supersonic、Databricks Genie、Snowflake Cortex Analyst、SQLBot 对比；MySQL 松散索引扫描与本机 5.7 / 8.0 EXPLAIN 实测 | 采纳：spec 02 §4.11「大表索引路径」（`BIG_TABLE_NO_INDEX`、`NO_LOOSE_SCAN`，验收 17、18）、spec 05 §4.1 `values`；plan 02 Task 14、15 |
+| [03-architecture-baseline-review.md](03-architecture-baseline-review.md) | 2026-11-24 | 用户提供的《SQLClaw Architecture Baseline》v1.0.2 / v1.0.3 审阅：结构摘要、§16 已知问题逐条核对、逐条采纳表、文档自身的技术问题、引用核实 | 部分采纳：新增 spec 00；spec 01/03/07/08/09 与 architecture 修订说明第 10 条的 2026-11-24 修订；plan 02 Task 17 前置提醒。待定：兜底通道去留（spec 08 顶部） |
+| [04-architecture-baseline-v1.0.3.md](04-architecture-baseline-v1.0.3.md) | 2026-11-24 | 《SQLClaw Architecture Baseline》v1.0.3 原文存档（目标架构参考，非现行规格）；开头附 §0–§20 章节对照表和原文已知问题 | 不直接生效；采纳结论见 03 |
 
 ## 难题
 

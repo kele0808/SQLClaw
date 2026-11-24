@@ -4,6 +4,7 @@
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 2、3）。4.3 影响分析额外列出受影响的问答样例（Spec 05 S9，不写 STALE 标记）；`metadata.sync_and_diff` 在结构变化后入队 `metadata.value_index`（Spec 02 M10）。均属 **MVP**。
+  - 2026-11-24：采纳 Architecture Baseline 审阅结论（`docs/research/03-architecture-baseline-review.md`、`docs/specs/00-contracts.md`）。D1 写明每轮重新授权、会话不携带授权（4.2）；D4 写明 `sql` 是实际执行语句、`certified = false` 的兜底结果在页面显示"非认证口径"，API 保持 `/api/v1`、弃用规则推迟（4.5、4.6）。属于 **MVP**，不新增接口。
 - 对应架构文档：17.5（多轮对话）、9.6（口径标注上的修改）、5.1/5.2/5.5/16.1/16.2 的 MVP 修订（手动 Diff、STALE、发布与回滚、门禁）、第二十章（API）、第二十一章（MVP 部署）、22.2（MVP 验收）、第二十三章（第 6 周）
 - 依赖：Spec 01（API 骨架、队列、Compose）、Spec 02（快照、身份、release 与指针、`move_pointer`、STALE）、Spec 03（评测运行与判定）、Spec 04/05（依赖关系、`build_candidate_release`）、Spec 06（`IREditOp`、`apply_edits`）、Spec 07（鉴权、审计）、Spec 08（`run_query`、`QueryResponse`、`Clarification`、`query_execution`、LLM 接口）
 - 被依赖：无（MVP 最后一个子项目）
@@ -127,6 +128,7 @@ class EditDecision(BaseModel):
 - `NEW_QUESTION` → 以追问原文正常 `run_query`（同一会话）。
 - `UNRESOLVABLE` → `failed`，消息"请说明具体名称或条件"。用于"上一个结果里第一个部门"这类指向结果数据的指代：MVP 不把结果发给模型，因此无法解析指向结果行的代词，只支持指向上一轮 IR 中已有过滤值、维度、指标的指代（这是对 17.5 修订"指代消解指向上一轮结果中的实体"的收窄，原因见第 7 节）。
 - 跨轮 release 变化：续问总是使用当前活跃 release。若父查询的 IR 在新 release 上规划失败且错误为 `UNKNOWN_*`/`OBJECT_STALE`，返回 `failed`，消息"元数据已更新，上一轮的口径不再适用，请重新提问"（架构 17.5"旧 Query IR 也需要检查兼容性"）。
+- **每轮重新授权**（2026-11-24，Spec 00 I3，Spec 08 4.12 的续问规则）：`continue_query` 只从父查询取已确认的 IR、澄清选项和 `release_id` 作为输入，不取任何授权结论；新一轮按**本次请求**的 `principal`（重新经 `get_principal` 鉴权，角色或租户变化立即生效）走完整的 `run_query` → 规划 → `Gateway.execute`。父查询的 SQL、编译结果和执行结果都不复用。父查询为兜底结果时，续问结果不会因此变为已认证。
 - `turn_index = 父查询 turn_index + 1`；会话最多 20 轮，超过返回 `CONVERSATION_TOO_LONG`。
 - 评测多轮题：`AgentPredictor`（Spec 08）对 Spec 03 题目的 `turns` 依次调用 `continue_query(message=…)`，以最后一轮作为 `Prediction`；中间某轮不是 `completed` 时以该轮状态作为结果。实现后多轮题不再返回 `SKIPPED`。
 
@@ -256,7 +258,10 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 | GET | `/metrics` | `admin` | 运行指标（见下），参数 `days`（默认 7） |
 | POST | `/evaluation/run` | `admin` | 入队 `evaluation.run`（Spec 03），请求体 `{"predictor", "release_id"}`，`202 {"job_id"}` |
 
-`QueryApiResponse = QueryResponse（Spec 08）+ {"conversation_id": str, "adjustments": list[Adjustment]}`。所有 Agent 结果状态（`completed`/`needs_clarification`/`rejected`/`failed`）都用 HTTP 200 返回，以 `status` 区分；4xx/5xx 只用于请求、鉴权与系统错误。
+`QueryApiResponse = QueryResponse（Spec 08）+ {"conversation_id": str, "adjustments": list[Adjustment]}`。
+
+- **回答内容**（2026-11-24）：沿用 Spec 08 4.14 的受限字段；`sql` 是实际执行的语句（不是预览），`explain_sql = false` 时为空；`certified = false` 表示兜底结果（非认证口径）。`GET /query/{id}` 与 `GET /query/{id}/trace` 同样不返回检索明细、提示词与原始数据库错误。
+- **API 版本**（2026-11-24）：外部路径保持 `/api/v1`（不改为 `/v1`），与 IR 版本（`ir_version`）、release 相互独立。MVP 只做向后兼容的新增（新字段、新接口），客户端须忽略未知字段；弃用公告期、迁移窗口与 Sunset 规则属于 Spec 00 §7 的仅契约内容，有外部调用方后再定。所有 Agent 结果状态（`completed`/`needs_clarification`/`rejected`/`failed`）都用 HTTP 200 返回，以 `status` 区分；4xx/5xx 只用于请求、鉴权与系统错误。
 
 与第二十章相比：新增 `GET /jobs/{id}`、`POST /metadata/releases`、`POST /metadata/releases/{id}/publish`（发布需要显式入口与门禁）；暂不提供 `cancel` 与 `POST /datasources`（见 2.2）。
 
@@ -265,7 +270,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 ### 4.6 D5 最小查询页面
 
 - `apps/frontend/` 下三个静态文件，原生 JavaScript，无构建工具；`ui_enabled` 时由 FastAPI 以 `StaticFiles` 挂载在 `/ui/`。选择原因：MVP 只需一个页面，避免为此引入 Node 工具链；架构第二十一章 MVP 部署中的 `frontend` 由 API 进程承担。
-- 功能：输入 API Key（只存 `sessionStorage`）；输入问题；显示状态、SQL 预览（可折叠）、结果表格、口径标注（含调整按钮）、警告、澄清问题与选项按钮（有默认项时显示"都行"）、追问输入框、👍/👎 反馈、`trace_id`。
+- 功能：输入 API Key（只存 `sessionStorage`）；输入问题；显示状态、执行的 SQL（可折叠，标题写"执行的 SQL"，2026-11-24）、`certified = false` 时在结果上方显示"非认证口径：该查询未经结构化规划生成"、结果表格、口径标注（含调整按钮）、警告、澄清问题与选项按钮（有默认项时显示"都行"）、追问输入框、👍/👎 反馈、`trace_id`。
 - 安全：所有数据用 `textContent` 渲染，禁止 `innerHTML`（结果数据与 SQL 都是不可信内容）；`/ui/` 响应头 `Content-Security-Policy: default-src 'self'`、`X-Content-Type-Options: nosniff`。
 
 ### 4.7 D6 应用容器化
@@ -293,6 +298,7 @@ STALE 自动解决：发布 release R 时，对该数据源每条未解决、来
 12. D7：两个版本的 MVP 验收报告已归档。
 13. `ruff`、`mypy`、`pytest`、`pytest -m integration` 全部通过。
 14. （2026-11-22）验收 5 的场景中，依赖 `department` 维度的问答样例出现在 `ImpactReport.affected_examples`，且该样例在新 release 上不可用（Spec 05 4.9）；`sync_and_diff` 在快照变化后入队一条 `metadata.value_index` 任务，结构不变时不入队。
+15. （2026-11-24）续问重新授权：用户 A 以 `pii_viewer` 完成父查询后，把 A 的角色改为 `analyst`，`POST /query/{id}/continue` 追问"加上手机号"返回 `rejected`；API Key 被停用（`active = false`）后续问返回 401。兜底结果的 API 响应 `certified = false`，页面显示非认证提示（人工走查项）。
 
 ## 6. 新增依赖
 

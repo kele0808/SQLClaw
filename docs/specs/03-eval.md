@@ -4,6 +4,7 @@
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 1，P0）。新增 E9「分阶段指标」（检索召回、语义召回、失败阶段归因、调用次数与上下文 token、候选一致率，4.10）和 E10「干扰表规模压测」（在元数据层注入 0 / 100 / 500 张仿真干扰表及干扰指标，只记录不设门槛，4.11）；`Prediction`、`eval_run`、`eval_result`、`criteria.yaml`（`scale:`）与题目格式（`ir_expressibility`，Spec 06 Q9）相应扩展。均属 **MVP**：字段第 3 周随 Runner 建好，数值第 5 周起由 `AgentPredictor` 产生，E10 第 5～6 周运行。原因：合成库只有 13 张表，不压测就无法知道检索在几百张表时是否失效（架构 8.5 阶段升级的依据）。
+  - 2026-11-24：采纳 Architecture Baseline 审阅结论（`docs/research/03-architecture-baseline-review.md`，`docs/specs/00-contracts.md`）。E5 比对改为 int/Decimal 精确比较、只有涉及 float 时用容差（4.6）；新增题目类别 `out_of_coverage`（期望行为 `ABSTAIN`，从 `single_table`、`many_to_one_join` 各调 1 题，总数仍为 50，4.4）与弃答指标（4.8）；新增 E11「业务不变量与口径陷阱题」（4.12）。均属 **MVP**，弃答与不变量指标只记录、不参与 verdict，门槛在 Spec 08 待定决策（兜底通道去留）之后再定。
 - 对应架构文档：第十五章（评测）、第二十二章（22.1 50 题验收集、22.2 MVP 通过标准）、11.4（绕过测试集的执行环境）、17.4（多租户）、第二十三章（第 1～6 周并行的标注任务）
 - 依赖：Spec 01（Compose、Settings、队列、Alembic、`integration` 标记）、Spec 02（快照，用于校验题目引用的表）
 - 被依赖：04（用 `required_tables` 验收路径查找）、05（合成库的语义定义）、06（`GoldIrPredictor`）、07（租户视图与账号是网关第一道防线的开发夹具）、08（`AgentPredictor`）、09（发布门禁读取评测结果）
@@ -167,7 +168,7 @@ difficulty: medium                # simple | medium | complex | advanced
 tenant_id: 1001                   # 以哪个租户身份提问，默认 1001
 as_of: 2026-06-30                 # 相对时间的"今天"
 targets: [mysql57, mysql80]       # 默认两者都跑
-expected_behavior: ANSWER         # ANSWER | CLARIFY | REJECT
+expected_behavior: ANSWER         # ANSWER | CLARIFY | REJECT | ABSTAIN（2026-11-24）
 question: 各部门处理的工单数量和平均每张工单的处理时长
 turns: []                         # 仅 multi_turn 类：后续追问，按顺序；真值针对最后一轮
 gold_sql: |                       # ANSWER 必填；在 targets 的所有版本上都能执行
@@ -191,7 +192,8 @@ expected_assumptions: [DEFAULT_TIME_FIELD, DEFAULT_JOIN_ROLE]   # 可选：期�
 expected_clarification: null      # CLARIFY 题必填：METRIC_DEFINITION | JOIN_ROLE | ENTITY_REFERENCE（Spec 08 的澄清类型）
 required_tables: [t_work_order, t_employee, t_department, t_work_process]
 ir_expressibility: EXPRESSIBLE    # 2026-11-22：EXPRESSIBLE | FALLBACK_EXPECTED，Spec 06 Q9 在编译器开工前标注；ANSWER 题第 3 周起必填
-tags: [fanout, pre_aggregation]
+tags: [fanout, pre_aggregation]   # 口径陷阱题加 semantic_trap（4.12）
+oracles: []                       # 2026-11-24，可选：业务不变量（4.12）
 status: REVIEWED                  # DRAFT | REVIEWED
 author: <标注人>
 reviewed_by: <评测集审核人>       # status 为 REVIEWED 时必填，且不能等于 author
@@ -204,8 +206,8 @@ notes: 口径说明
 
 | `category` | 题数 | `expected_behavior` |
 | --- | --- | --- |
-| `single_table` | 8 | ANSWER |
-| `many_to_one_join` | 10 | ANSWER |
+| `single_table` | 7 | ANSWER |
+| `many_to_one_join` | 9 | ANSWER |
 | `fanout_risk` | 6 | ANSWER |
 | `ratio` | 6 | ANSWER |
 | `time_offset` | 5 | ANSWER |
@@ -214,9 +216,10 @@ notes: 口径说明
 | `multi_turn` | 3 | ANSWER |
 | `should_clarify` | 2 | CLARIFY |
 | `should_reject` | 2 | REJECT |
+| `out_of_coverage`（2026-11-24） | 2 | ABSTAIN |
 | 合计 | 50 | |
 
-`dataset.py` 加载时校验：ID 唯一且与文件名一致；配比与上表一致（`--allow-partial` 时只校验不超额，用于第 1～3 周）；ANSWER 题有 `gold_sql`；CLARIFY 题有 `expected_clarification`；`required_tables` 中的表在给定快照中存在；`gold_sql` 能被 SQLGlot 以 mysql 方言解析。数据集哈希 = 所有题目文件按文件名排序后内容的 sha256。
+`dataset.py` 加载时校验：ID 唯一且与文件名一致；配比与上表一致（`--allow-partial` 时只校验不超额，用于第 1～3 周）；ANSWER 题有 `gold_sql`；CLARIFY 题有 `expected_clarification`；ABSTAIN 题没有 `gold_sql`，且 `notes` 写明为什么语义层和合成库都表达不了（如"客户满意度"，库里没有对应数据）；`required_tables` 中的表在给定快照中存在；`gold_sql` 能被 SQLGlot 以 mysql 方言解析。数据集哈希 = 所有题目文件按文件名排序后内容的 sha256。
 
 ### 4.5 标注约定（写入 `benchmarks/acceptance/README.md`）
 
@@ -243,7 +246,7 @@ class ResultSet:
 @dataclass(frozen=True)
 class CompareOptions:
     order_sensitive: bool = False
-    float_abs_tol: float = 1e-4
+    float_abs_tol: float = 1e-4       # 只用于涉及 float 的比较（2026-11-24）
     float_rel_tol: float = 1e-6
     max_extra_columns: int = 4
 
@@ -259,7 +262,7 @@ def compare_results(gold: ResultSet, pred: ResultSet, opts: CompareOptions) -> C
 
 规则：
 
-1. 值规范化：`Decimal`、`int`、`float` 统一为 `float` 比较（容差：`|a-b| <= abs_tol` 或 `<= rel_tol * max(|a|,|b|)`）；`datetime` 转 ISO 字符串；`date` 转 `YYYY-MM-DD`；`bytes` 按 UTF-8 解码；`None` 只等于 `None`。
+1. 值规范化（2026-11-24 修订，原为三者统一转 `float`）：`int` 与 `Decimal` 之间**精确比较**（`int` 转 `Decimal`；两个 `Decimal` 小数位数不同时，先按两者中**较少**的小数位数以 `ROUND_HALF_EVEN` 对齐，再判等，例如 MySQL `AVG` 在不同写法下返回 4 位与 8 位小数）；任一方为 `float` 时两者都转 `float`，按容差比较（`|a-b| <= abs_tol` 或 `<= rel_tol * max(|a|,|b|)`）；`bool` 不当作数值；`datetime` 转 ISO 字符串；`date` 转 `YYYY-MM-DD`；`bytes` 按 UTF-8 解码；`None` 只等于 `None`。
 2. 行数不同 → `ROW_COUNT`。
 3. 列对齐：预测列数 − 金标准列数 > `max_extra_columns` → `TOO_MANY_EXTRA_COLUMNS`。对金标准每一列，找出值多重集（规范化后排序）与之相等的预测列作为候选；在候选的笛卡尔积中（上限 1000 种）寻找一组互不重复的映射，使投影后的行多重集与金标准相等。找不到 → 有某列无候选则 `NO_COLUMN_ALIGNMENT`，否则 `VALUES`。
 4. `order_sensitive = true` 时，在找到的映射下逐行比较顺序，不一致 → `ORDER`。
@@ -289,7 +292,7 @@ class RetrievalTrace:                        # 2026-11-22：E9 用，由 AgentPr
 
 @dataclass(frozen=True)
 class Prediction:
-    behavior: Literal["ANSWER", "CLARIFY", "REJECT", "ERROR", "SKIPPED"]
+    behavior: Literal["ANSWER", "CLARIFY", "REJECT", "ABSTAIN", "ERROR", "SKIPPED"]   # ABSTAIN 2026-11-24
     sql: str | None = None
     result: ResultSet | None = None          # 为空时由 Runner 用租户账号执行 sql
     ir: dict[str, Any] | None = None
@@ -337,7 +340,7 @@ uv run python -m text2sql.evaluation report RUN_ID
 
 **`eval_run`**：`id` BIGINT identity；`dataset_name`（`acceptance`）；`dataset_hash CHAR(64)`；`data_fingerprint CHAR(64)`（指纹表内容的 sha256）；`target`；`datasource_id`；`release_id` FK → `metadata_release`；`predictor`；`git_commit VARCHAR(40)` 可空；`status`（`RUNNING` / `COMPLETED` / `INVALID` / `FAILED`）；`summary JSONB`；`verdict`（`PASS` / `FAIL` / `NOT_EVALUATED`）；`started_at`；`finished_at`；`requested_by`；`trace_id`；`distractors INT` 默认 0（2026-11-22，E10）。迁移同时给 `metadata_release.eval_run_id` 加外键（Spec 02 预留）。
 
-**`eval_result`**：`id`；`run_id` FK；`question_id`；`category`；`expected_behavior`；`actual_behavior`；`plan_mode`；`sql TEXT`；`result_match BOOLEAN` 可空；`compare_reason`；`inflated BOOLEAN`；`ir_field_scores JSONB`（`{"metrics": true, "dimensions": false, "time": true, "filters": true}`，无 `expected_ir` 时为空）；`assumption_label_present BOOLEAN`；`clarification_type`；`error_category`；`query_id`；`trace_id`；`elapsed_ms`；`llm_input_tokens`；`llm_output_tokens`；2026-11-22（E9）：`retrieval JSONB` 可空（`RetrievalTrace`）、`table_recall REAL` 可空（recall@8）、`semantic_recall BOOLEAN` 可空、`failure_stage VARCHAR(16)` 可空、`candidate_agreement REAL` 可空、`llm_calls INT`、`context_tokens INT`。唯一 `(run_id, question_id)`。
+**`eval_result`**：`id`；`run_id` FK；`question_id`；`category`；`expected_behavior`；`actual_behavior`；`plan_mode`；`sql TEXT`；`result_match BOOLEAN` 可空；`compare_reason`；`inflated BOOLEAN`；`ir_field_scores JSONB`（`{"metrics": true, "dimensions": false, "time": true, "filters": true}`，无 `expected_ir` 时为空）；`assumption_label_present BOOLEAN`；`clarification_type`；`error_category`；`query_id`；`trace_id`；`elapsed_ms`；`llm_input_tokens`；`llm_output_tokens`；2026-11-22（E9）：`retrieval JSONB` 可空（`RetrievalTrace`）、`table_recall REAL` 可空（recall@8）、`semantic_recall BOOLEAN` 可空、`failure_stage VARCHAR(16)` 可空、`candidate_agreement REAL` 可空、`llm_calls INT`、`context_tokens INT`；2026-11-24（E11）：`oracle_violations JSONB` 可空。唯一 `(run_id, question_id)`。
 
 `summary` 字段（也是 `report.json` 的主体）：
 
@@ -381,6 +384,10 @@ uv run python -m text2sql.evaluation report RUN_ID
 | `reject_rate` | REJECT 题中 `actual_behavior = REJECT` 的比例 |
 | `clarify_recall` | CLARIFY 题中触发澄清且 `clarification_type` 与期望一致的比例 |
 | `false_clarify_rate` | 非 CLARIFY 题中触发澄清的比例 |
+| `abstain_recall`（2026-11-24） | ABSTAIN 题中 `actual_behavior = ABSTAIN` 的比例 |
+| `unsupported_false_answer_rate`（2026-11-24） | ABSTAIN 题中仍给出 `ANSWER` 的比例（含走兜底作答）；可信度的关键指标 |
+| `false_abstain_rate`（2026-11-24） | ANSWER 题中 `actual_behavior = ABSTAIN` 的比例（同时计入 `execution_accuracy` 的分母） |
+| `oracle_violations`（2026-11-24） | 见 4.12 |
 | `assumption_label_coverage` | `actual_behavior = ANSWER` 的题中带口径标注的比例 |
 | `fallback_ratio` / `fallback_accuracy` | 作答题中 `plan_mode = FALLBACK_SQL` 的比例 / 其中 `result_match` 的比例 |
 | `trace_coverage` | 结果中 `trace_id` 非空的比例 |
@@ -408,7 +415,7 @@ scale:                             # 2026-11-22（E10）：只记录，不参与
 
 `scale:` 标红是启动架构 8.5 检索阶段 B 的依据之一，不影响 MVP 验收。
 
-`verdict = PASS` 当且仅当所有阈值满足、`status = COMPLETED`、且（`require_reviewed_questions` 时）50 题均为 `REVIEWED`。绕过测试集 100% 拦截由 Spec 07 的 `tests/security` 保证，不在本判定内。Fallback 指标只记录（22.2）。MVP 验收要求 `mysql57` 与 `mysql80` 两次运行都 `PASS`。
+`verdict = PASS` 当且仅当所有阈值满足、`status = COMPLETED`、且（`require_reviewed_questions` 时）50 题均为 `REVIEWED`。绕过测试集 100% 拦截由 Spec 07 的 `tests/security` 保证，不在本判定内。Fallback 指标只记录（22.2）。弃答与 4.12 的不变量指标（2026-11-24）也只记录，门槛在 Spec 08 顶部的待定决策之后再加入本文件。MVP 验收要求 `mysql57` 与 `mysql80` 两次运行都 `PASS`。
 
 ### 4.10 E9 分阶段指标（2026-11-22 新增）
 
@@ -447,6 +454,36 @@ scale:                             # 2026-11-22（E10）：只记录，不参与
 
 > 参考：[Spider 2.0](https://arxiv.org/abs/2411.07763)（企业库常超过 1000 列，经典流水线在其上近乎失效）、[BEAVER](https://arxiv.org/abs/2409.02038)（812 张表的真实数仓，SOTA agent 只有 10.8%）说明规模本身是主要难点；[MDB-Link](https://arxiv.org/abs/2608.09588) 与 [LinkAlign](https://arxiv.org/abs/2503.18596) 用"加入大量无关库/表"构造检索压力，本节是同一思路在元数据层的低成本实现。
 
+### 4.12 E11 业务不变量与口径陷阱题（2026-11-24 新增）
+
+结果集比对只能发现"和真值不同"，不能说明错在哪种口径。E11 补两类检查，参考 Architecture Baseline §11.4 的 Semantic Oracle：
+
+**业务不变量（`oracles`）**：题目可选字段，每条是对**预测结果**的断言，由 `oracles.py` 用固定的小语法求值（不执行任意代码）：
+
+```yaml
+oracles:
+  - {kind: NON_NEGATIVE, column: work_order_count}            # 指标列不为负
+  - {kind: RANGE, column: completion_rate, min: 0, max: 1}     # 比率在区间内
+  - {kind: UNIQUE_KEYS, columns: [department_id]}           # 维度组合不重复（无重复分组）
+  - {kind: LTE_COLUMN, column: resolved_count, other: work_order_count}           # 子集计数不超过总数
+```
+
+- 列按 4.6 的列对齐结果定位；对不齐时该题记 `ORACLE_UNRESOLVED`，不算违反。
+- 违反记入 `eval_result.oracle_violations JSONB`（`[{kind, column, detail}]`）；报告列出违反题。只记录，不参与 verdict。
+- 断言必须是合成库上**确定成立**的规则（由评测集审核人确认），不是"通常成立"。
+
+**口径陷阱题（`tags: [semantic_trap, …]`）**：从现有 ANSWER 类别中选题打标签，不新增类别。每题针对一种"SQL 能执行但口径错"的情形，`notes` 写明陷阱：
+
+| 陷阱 | 合成库中的例子 |
+| --- | --- |
+| 时间字段用错 | "上月完成的工单数"按创建时间而不是完成时间统计 |
+| 漏默认过滤 | 漏掉 `is_deleted = 0` |
+| 一对多连接后重复计数 | 工单直接连处理记录后 `COUNT(w.id)` |
+| 粒度错误 | 先按处理记录求平均再按工单汇总，与"每张工单平均处理时长"不同 |
+| 漏必需的业务条件 | "已解决率"的分母包含已作废工单 |
+
+报告按 `semantic_trap` 标签单列正确率，与 `failure_stage` 一起作为 Spec 06 规划规则与 Spec 05 默认口径的回归输入。至少 6 道 ANSWER 题带 `semantic_trap`，覆盖上表每一行。
+
 ## 5. 验收标准
 
 1. `schema.sql` 在 `mysql57` 与 `mysql80` 上都能执行；`seed` 在两个版本上完成后，`_t2s_fingerprint` 中 13 张表的行数与校验和完全一致（集成测试）。
@@ -463,6 +500,7 @@ scale:                             # 2026-11-22（E10）：只记录，不参与
 12. （2026-11-22，E9）用构造的 `Prediction` 单元测试每个 `stage.*` 指标与 `failure_stage` 归因（漏召一张表 → `RETRIEVAL`；召回完整但维度错 → `UNDERSTANDING`）；`gold_sql` 运行的 `stage` 为 `null`。
 13. （2026-11-22，E10）同一种子两次 `distractors build --count 100` 生成相同的表名与列；生成的表名与真实表不冲突、20/40/40 配比正确、其中表族副本被 Spec 02 M9 识别为表族；派生数据源的候选 release 能被 Spec 05 加载；`run --distractors 100` 时 `eval_run.distractors = 100`，release 不属于 `__d100` 时拒绝运行。
 14. （2026-11-22）`validate-dataset` 在第 3 周起要求每道 ANSWER 题有 `ir_expressibility`（`--allow-partial` 时只警告）。
+15. （2026-11-24）比对器单元测试：`int` 与 `Decimal` 相等、`Decimal('0.3333')` 与 `Decimal('0.33333333')` 按较少小数位对齐后相等、`Decimal` 与 `float` 走容差、`1` 与 `True` 不相等；`out_of_coverage` 题配比与 `ABSTAIN` 行为校验；`oracles.py` 每种 `kind` 有通过、违反、`ORACLE_UNRESOLVED` 三种用例；`abstain_recall`、`unsupported_false_answer_rate`、`false_abstain_rate` 有构造数据的单元测试。
 
 ## 6. 新增依赖
 

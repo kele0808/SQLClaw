@@ -4,9 +4,22 @@
 - 日期：2026-11-20
 - 修订记录：
   - 2026-11-22：采纳大 Schema 调研（`docs/research/01-text2sql-sota.md` 建议 1～4）。A3 检索增加值索引命中、问答样例召回、表排序与命中来源（供 Spec 03 分阶段指标），一级摘要按表族折叠（4.4）；A4 用样例做 few-shot，并生成 k 个 IR 候选、规划后按 `canonical_ir_hash` 投票（4.5）；A5 先查 Spec 02 值索引再经网关确认（4.6）；A6 增加"候选分歧"来源（4.7）；状态、持久化、`AgentPredictor` 相应扩展；新增 CLI `export-example`。以上均属 **MVP**（第 5 周）。依赖 Spec 02 M9/M10、Spec 05 S9、Spec 06 `canonical_ir_hash`。
+  - 2026-11-24：采纳 Architecture Baseline 审阅结论（`docs/research/03-architecture-baseline-review.md`、`docs/specs/00-contracts.md`）。`understanding_samples` 默认改为 1，只在质量信号触发时补采候选（4.1、4.5）；LLM 错误分类：429 按 `Retry-After`、剩余时限不足不重试、单题 token 上限 `llm_max_tokens_per_query`（4.1、4.2）；修复次数统一为"结构重问 1 次 + 修复 1 次"（`max_repair_attempts` 默认 2 → 1，4.9）；理解意图增加 `OUT_OF_COVERAGE`（弃答，4.5）；写明规划后发现的歧义同样转澄清（4.7）与多轮续问规则（4.12）；响应增加 `certified`，写明 `sql` 字段是实际执行语句、受限的回答内容（4.14）。**新增顶部待定决策：兜底通道去留，写本 Spec 的 implementation plan 之前必须先定。**
 - 对应架构文档：第十二章（12.1～12.3）、8.4/8.5（Schema 摘要 + 关键词检索，阶段 A）、9.4（兜底通道）、9.6（歧义评分与澄清）、第十三章（修复）、第十四章（结果校验与血缘）、11.6（Prompt 注入与上下文最小化）、2.1（信任边界）、3（模型接入层可替换）、第二十三章（第 5 周）
 - 依赖：Spec 01（LangGraph 挂载点、`trace_id`、队列）、Spec 02（release 指针、`StaleSet`、`mark_stale`、`comment_visible`）、Spec 03（`Predictor`、`Prediction`）、Spec 04（`connect_tables`）、Spec 05（`ReleaseBundle`、术语、实体查找维度、`build_candidate_release`）、Spec 06（`QueryIR`、`compile_ir`、`PlanError`、`IREditOp`、`Assumption`、`MetricLineage`）、Spec 07（`Gateway`、`Principal`、`GatewayError`、`ErrorCategory`）
 - 被依赖：09（HTTP API、多轮续问、页面）
+
+> ## ⚠️ 待定决策（阻塞本 Spec 的 implementation plan）：`FALLBACK_SQL` 还是 Exploratory 单表 DSL
+>
+> - 记录日期：2026-11-24；来源：Architecture Baseline v1.0.2 / v1.0.3 底线 1"LLM 不得绕过 DSL/IR 直接生成 SQL"与 §4 Exploratory 单表 DSL；审阅见 `docs/research/03-architecture-baseline-review.md` §4；架构侧记录见 `docs/architecture.md` 修订说明第 10 条与 9.4。
+> - **现在的做法**：保留 4.8 的 `FALLBACK_SQL` 兜底通道，但兜底结果一律 `certified = false`，带"非认证口径"标识（`assumptions` 中的 `FALLBACK_SQL` 与警告"该查询未经结构化规划生成，口径未经认证"），不得导出为问答样例（4.14），并在 Spec 03 与 Spec 09 `/metrics` 中单独统计（`fallback_ratio`、`fallback_accuracy`）。
+> - **何时决定**：写 Spec 08 的 implementation plan **之前**（plan 第一步就是确认本决策）。
+> - **依据**：Spec 03 评测的 `fallback_ratio`、`fallback_accuracy`、`unsupported_false_answer_rate`，以及 Spec 06 Q9 的 `ir_expressibility` 标注中 `FALLBACK_EXPECTED` 的占比。
+> - **决策规则**：
+>   - 兜底占比低（如 `FALLBACK_EXPECTED` ≤ 10% 且 `fallback_ratio` ≤ 10%）→ **删除兜底通道**，改为"弃答 + Exploratory 单表 DSL"（单表、白名单算子、结果带非认证标识；表示层遵守 Spec 00 §4 的 `COUNT(*)` 与带类型引用约定），同步修订本 Spec 4.8/4.9、Spec 06 `plan_mode`、Spec 07 对兜底 SQL 的处理、Spec 03 的兜底指标。
+>   - 兜底占比高（如 > 15%，与 Spec 06 §7 的启用条件一致）→ **保留并扩展结构化表达**：优先扩展 IR，或启用 Spec 06 §7 的"语义视图上写 SQL、SQLGlot 展开"通道；兜底仍保持非认证标识。
+>   - 介于两者之间 → 按失败集中的算子类别决定，结论写入 `docs/architecture.md` 第二十四章并删除本块。
+> - 阈值是建议值，决定时以实测数据为准。
 
 ## 1. 目标
 
@@ -92,10 +105,12 @@ tests/integration/agent/…
 | `llm_api_key` | `T2S_LLM_API_KEY` | `SecretStr \| None` | `None` |
 | `llm_timeout_s` | `T2S_LLM_TIMEOUT_S` | `int` | `60` |
 | `llm_max_output_tokens` | `T2S_LLM_MAX_OUTPUT_TOKENS` | `int` | `2048` |
-| `max_repair_attempts` | `T2S_MAX_REPAIR_ATTEMPTS` | `int` | `2` |
+| `max_repair_attempts` | `T2S_MAX_REPAIR_ATTEMPTS` | `int` | `1`（2026-11-24：原为 2，见 4.9） |
 | `agent_deadline_s` | `T2S_AGENT_DEADLINE_S` | `int` | `90` |
 | `llm_explain_results` | `T2S_LLM_EXPLAIN_RESULTS` | `bool` | `False` |
-| `understanding_samples` | `T2S_UNDERSTANDING_SAMPLES` | `int`（1～5） | `3`：A4 生成的 IR 候选数，1 表示关闭投票（2026-11-22） |
+| `understanding_samples` | `T2S_UNDERSTANDING_SAMPLES` | `int`（1～5） | `1`（2026-11-24：原为 3）：A4 首次生成的 IR 候选数，1 表示默认不投票 |
+| `understanding_samples_on_signal` | `T2S_UNDERSTANDING_SAMPLES_ON_SIGNAL` | `int`（1～5） | `3`（2026-11-24）：质量信号触发时补采到的候选总数，1 表示关闭补采（4.5） |
+| `llm_max_tokens_per_query` | `T2S_LLM_MAX_TOKENS_PER_QUERY` | `int` | `60000`（2026-11-24）：单题所有模型调用的输入 + 输出 token 上限（4.2） |
 | `understanding_temperature` | `T2S_UNDERSTANDING_TEMPERATURE` | `float`（0～1.5） | `0.7`：第 2 个及以后候选的温度；第 1 个候选固定 0（2026-11-22） |
 | `retrieval_example_k` | `T2S_RETRIEVAL_EXAMPLE_K` | `int`（0～5） | `3`：召回的问答样例数，0 表示不用样例（2026-11-22） |
 
@@ -138,7 +153,19 @@ def call_structured(provider: LLMProvider, task: LLMTask, messages: list[LLMMess
 
 - `call_structured`：把 `output_model.model_json_schema()` 放进请求；解析失败或 pydantic 校验失败时，把校验错误（不含业务数据）附在追加消息中**重问一次**；仍失败抛 `LLMOutputError`。重问不计入修复次数，但用量照常记录。
 - `FakeLLM`（`providers/fake.py`）：按 `task` 维护脚本队列或回调函数，记录收到的全部请求，供测试断言"什么内容进了模型上下文"。
-- `OpenAICompatibleProvider`：用 `httpx` 调用 `POST {base_url}/chat/completions`（`model`、`messages`、`temperature`、`max_tokens`、`response_format={"type": "json_object"}`），读取 `usage`；超时 `llm_timeout_s`，对 5xx 与超时重试 1 次。选择这一协议的原因：境外 API、国内模型服务和私有化部署（如 vLLM 部署 Qwen）普遍提供兼容接口，一个适配器即可覆盖 11.6 的三种选型；**具体用哪家由合规结论决定**，不在本 Spec 选定。不引入任何供应商 SDK。
+- `OpenAICompatibleProvider`：用 `httpx` 调用 `POST {base_url}/chat/completions`（`model`、`messages`、`temperature`、`max_tokens`、`response_format={"type": "json_object"}`），读取 `usage`；超时 `llm_timeout_s`，对 5xx 与超时重试 1 次（2026-11-24：重试规则见下方"错误分类"）。选择这一协议的原因：境外 API、国内模型服务和私有化部署（如 vLLM 部署 Qwen）普遍提供兼容接口，一个适配器即可覆盖 11.6 的三种选型；**具体用哪家由合规结论决定**，不在本 Spec 选定。不引入任何供应商 SDK。
+- **错误分类与重试**（2026-11-24，Spec 00 §5）：
+
+| 类别 | 判定 | 处理 | 失败时的错误码 |
+| --- | --- | --- | --- |
+| 传输错误 / 5xx / 超时 | `httpx` 连接错误、5xx、`llm_timeout_s` 到时 | 重试 1 次（首次 + 1） | `LLM_UNAVAILABLE` |
+| 限流 | HTTP 429 | 有 `Retry-After` 且 `now + Retry-After + llm_timeout_s` 不超过 `deadline_monotonic` 时等待后重试 1 次；否则不重试 | `LLM_RATE_LIMITED` |
+| 输出无效 | 无法解析为 JSON 或 pydantic 校验失败 | `call_structured` 重问 1 次（不计修复次数） | `LLM_OUTPUT_INVALID`（即 `LLMOutputError`） |
+| 超预算 | 已用 token（含重试、重问、修复、多候选）≥ `llm_max_tokens_per_query`，或本次请求的 `max_output_tokens` 会使总量超限 | 不再发起模型调用 | `LLM_BUDGET_EXCEEDED` |
+
+  - 任何重试或重问前都检查剩余时限：剩余时间不足一个 `llm_timeout_s` 时不重试，直接按上表失败（不等到 `AGENT_DEADLINE_EXCEEDED`）。
+  - 语义歧义、权限、STALE、版本不支持不属于 LLM 错误，**不通过重试解决**（转澄清、拒绝或失败，见 4.7、4.9）。
+  - 以上失败都使查询进入 `failed`，`error_code` 为表中的码；每次尝试（含失败）写入 `query_trace_event`（`llm_task`、`error_category`、token），`llm_calls` 计入全部尝试。
 - 版本记录：`prompt_version = "p_" + sha256(按文件名排序的 prompts/*.yaml 内容)[:12]`；`model_version = f"{provider.name}:{provider.model}"`。本 Spec 扩展 Spec 05 的 `build_candidate_release`，把两者写入新建的 release（架构第十九章修订）。
 
 ### 4.3 A2 上下文构建与净化
@@ -218,7 +245,7 @@ class EntityMention(BaseModel):
     text: str                          # 问题中的原文，如 "华东精密"
 
 class UnderstandingOutput(BaseModel):
-    intent: Literal["ANALYTICAL_QUERY", "DATA_MODIFICATION", "OUT_OF_SCOPE"]
+    intent: Literal["ANALYTICAL_QUERY", "DATA_MODIFICATION", "OUT_OF_SCOPE", "OUT_OF_COVERAGE"]   # OUT_OF_COVERAGE 2026-11-24
     ir: QueryIR | None                 # intent = ANALYTICAL_QUERY 时必填
     term_mentions: list[TermMention] = []
     entity_mentions: list[EntityMention] = []
@@ -226,8 +253,12 @@ class UnderstandingOutput(BaseModel):
 
 - 提示词给出：语义目录（指标、维度及其路径角色与标签、枚举标签、术语）、默认口径（`defaults.yaml`）、`as_of`、`QueryIR` 的 JSON Schema、召回的问答样例（few-shot，2026-11-22）、值索引候选（2026-11-22），以及规则：只能使用目录中的指标与维度；表达不了时把 `plan_mode` 设为 `FALLBACK_SQL` 并填写 `fallback.reason`/`detail`；不确定用哪个口径时不要猜，在 `term_mentions` 中写出术语；实体名称写入 `entity_mentions`，IR 中对应过滤的 `values` 留空。
 - `intent = DATA_MODIFICATION`（删除、修改数据）或 `OUT_OF_SCOPE`（与数据查询无关）→ 状态 `rejected`。
+- `intent = OUT_OF_COVERAGE`（2026-11-24）：是数据查询，但语义目录和召回的表里都没有能回答它的指标或字段（如"客户满意度"）→ 状态 `failed`，`error_code = OUT_OF_COVERAGE`，消息"当前数据和指标定义无法回答该问题"（弃答，Spec 00 §2.1）。提示词要求模型在"不确定能否表达"时选择 `FALLBACK_SQL` 而不是猜测指标，在"确定没有对应数据"时选择 `OUT_OF_COVERAGE`。
 
-**多候选与一致性投票**（2026-11-22 新增）：
+**多候选与一致性投票**（2026-11-22 新增；2026-11-24 改为默认关闭、按质量信号补采）：
+
+- 默认只生成 1 个候选（`understanding_samples = 1`）。候选 1 规划后出现以下**质量信号**之一，且剩余时限与 token 预算足够时，补采候选到 `understanding_samples_on_signal` 个，再按下列投票规则判定：规划返回 `PlanFailed` 或 `Unsupported`（在进入修复或兜底之前）。补采的候选与投票规则同原设计；未触发时 `candidate_agreement = 1.0`。
+- 原因：Architecture Baseline 底线 3"不默认使用多候选"，且 k = 3 的收益在本项目上尚未实测（§7）。第 5 周用 Spec 03 对照运行（始终 k = 3 vs 按信号补采）比较准确率和成本。
 
 - 生成 `k = understanding_samples` 个 `UnderstandingOutput`：候选 1 用温度 0 和全部召回样例；候选 i（i ≥ 2）用温度 `understanding_temperature`，样例集合去掉第 i−1 个样例（样例不足时只改温度），让候选之间有差异。k 次调用并发执行，每次都受 `call_structured` 的重问规则约束，用量逐次记录（`llm_calls` 计数）。
 - 意图投票：多数候选为 `DATA_MODIFICATION`/`OUT_OF_SCOPE` → `rejected`；否则只保留 `ANALYTICAL_QUERY` 候选。
@@ -294,6 +325,7 @@ class Clarification(BaseModel):
 - 选项最多 3 个：按"VERIFIED 优先、再按定义顺序"取前 3；问题文案为模板（如"'员工的工单'是指哪种口径？"），并说明默认项："如不指定，将按 <默认项> 统计"。
 - `default_option_id`：`METRIC_DEFINITION` 与 `JOIN_ROLE` 取第一个选项（架构 9.6"用户不回答或回答都行时用默认口径执行"）；`ENTITY_REFERENCE` 为 `None`（重名实体必须由用户选择，否则返回错误数据）。
 - 选项的 `edits`：术语 → `SetMetrics`（把 IR 中对应指标替换为候选）；角色 → `SetJoinRole`；实体 → `RemoveFilter` + `AddFilter`（键值过滤）。
+- **两个发现位置**（2026-11-24 写明）：理解阶段（术语、实体提及）与规划之后（`AMBIGUOUS_JOIN_ROLE`、候选分歧）发现的歧义都进入本节的澄清，这是有意设计：Join 角色歧义只有确定性规划器能发现。Architecture Baseline 只在 DSL 之前设澄清入口，本 Spec 不采纳那种单入口（Spec 00 I8）。
 - 澄清时状态为 `needs_clarification`，不生成 SQL；`Clarification` 存入 `query_execution.clarification`，回答由 Spec 09 处理。
 
 ### 4.8 A7 兜底通道（架构 9.4）
@@ -304,7 +336,7 @@ class Clarification(BaseModel):
 - 提示词包含：上述表的 Level 3 摘要、允许的边、默认过滤规则（软删除）、语义层中相关指标的定义文本（让 LLM 复用口径，而不是自创）、目标库版本能力（5.7："不得使用 WITH 与窗口函数"）、`as_of` 与时间约定（Spec 03 4.5 的文本）、禁止项清单、行数上限。输出 `{"sql": str, "summary": str}`。
 - 生成后额外检查：SQL 引用的表 ⊆ `allowed_tables`，否则视为校验失败（类别 `EDGE_NOT_VERIFIED`，阶段 `SEMANTIC`），进入修复。
 - 然后按普通路径交给 `Gateway.execute`（全量校验一项不少）。
-- 结果标注：`assumptions` 追加 `FALLBACK_SQL`（"该查询未经结构化规划生成"），`plan_mode = FALLBACK_SQL`，`fallback_reason` 记录原因类别（统计 `fallback_ratio` 与扩展 IR 的输入）。
+- 结果标注：`certified = false`（2026-11-24，见顶部待定决策）；`assumptions` 追加 `FALLBACK_SQL`（"该查询未经结构化规划生成，口径未经认证"），`plan_mode = FALLBACK_SQL`，`fallback_reason` 记录原因类别（统计 `fallback_ratio` 与扩展 IR 的输入）。
 - 若问题依赖的指标在语义层不存在（`METRIC_NOT_DEFINED`），结果额外警告"口径由系统临时推断，未经业务定义"（架构 7.2）。
 
 ### 4.9 A8 修复（第十三章）
@@ -322,7 +354,9 @@ class Clarification(BaseModel):
 | 权限、禁止类、成本超限、超时、繁忙 | 拒绝或失败，说明原因（成本与超时提示缩小范围） | 否 |
 | 结果为空 | 不是错误；由结果校验给出提示（13.2 修订） | 否 |
 
-修复次数达到 `max_repair_attempts` 后失败。每次修复在 `query_trace_event` 中记录错误类别与是否成功，供按类别统计修复成功率。
+修复次数达到 `max_repair_attempts` 后失败。
+
+**修复次数统一**（2026-11-24）：每题最多"结构重问 1 次（4.2 `call_structured`，针对 JSON/Schema 不合法）+ 修复 1 次（`repair_ir` 或 `repair_sql`，针对规划或执行的可修复错误）"，与 Architecture Baseline 的"结构性修复最多一次"一致；原默认 2 次修复改为 1 次。两者都受 `llm_max_tokens_per_query` 与 `deadline_monotonic` 约束，任一用尽即停止。第 5 周若评测显示第 2 次修复成功率明显，再在 `criteria` 对照后调回 2。每次修复在 `query_trace_event` 中记录错误类别与是否成功，供按类别统计修复成功率。
 
 ### 4.10 A9 结果校验与血缘（第十四章）
 
@@ -422,6 +456,14 @@ flowchart TD
 - **AST / 语义 / 成本校验不单独成节点**：它们都在 `Gateway.execute` 内完成（Spec 07 规定网关必须自己完整校验，不信任调用方），节点拆开会造成重复校验或绕过的可能。
 - **歧义评分在规划之后**：Join 角色歧义由确定性规划器发现（Spec 06），评分需要规划结果。
 
+**多轮续问规则**（2026-11-24，对应 Architecture Baseline v1.0.3 §9.3.3；实现在 Spec 09 D1）：
+
+1. 会话（`conversation` 与父查询的 `query_execution`）只保存**已确认**的内容：规划后的 IR（含口径）、用户选过的澄清选项、`release_id`。**不保存任何授权结论**：没有"上一轮已通过权限检查"的标记可供复用。
+2. 每一轮都产出**完整的** IR（父 IR 施加 `IREditOp`，或新问题重新理解），再走完整的规划 → 网关 `execute`（07 §4.8 每次完整校验）→ 审计；不复用父查询的 SQL、`CompiledQuery` 或网关结果。
+3. 每一轮以**当前请求的** `principal` 与当前活跃 release 执行；父查询的 IR 在新 release 上规划失败按 Spec 09 返回"元数据已更新"。
+4. 父查询为兜底结果（`certified = false`）时，续问不能把它当作已认证口径：新一轮若仍走兜底，照常标注非认证。
+5. 无法确定追问指向哪个指标、时间或条件时，按 4.7 澄清，不猜测。
+
 每个节点开始前检查 `deadline_monotonic`，超时则 `failed`（`AGENT_DEADLINE_EXCEEDED`）。`auto_execute = false` 时 `execute` 节点改调 `Gateway.check`，返回 SQL、EXPLAIN 摘要与口径，不返回数据（架构第二十章 `dry_run`）。
 
 ### 4.13 A11 持久化
@@ -463,7 +505,8 @@ class QueryResponse(BaseModel):
     status: Literal["completed", "needs_clarification", "rejected", "failed"]
     metadata_release_id: int
     plan_mode: Literal["IR", "FALLBACK_SQL"] | None
-    sql: str | None
+    certified: bool                     # 2026-11-24：plan_mode == "IR" 时为 True；兜底结果为 False（非认证口径）
+    sql: str | None                     # 实际执行的语句（executed_sql），见下
     execution: ExecutionInfo | None
     columns: list[str]
     data: list[list[Any]]
@@ -482,12 +525,14 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
               allow_distractor_release: bool = False) -> QueryResponse: ...   # 最后一个参数 2026-11-22，仅评测（Spec 03 E10）
 ```
 
+- **回答内容受限**（2026-11-24，Architecture Baseline §10）：`QueryResponse` 只包含上面列出的字段；不返回检索明细、提示词、`safe_detail` 以外的数据库错误、`ExplainSummary` 原文、release 组件明细与内部异常。`explanation` 只基于实际执行结果（4.11），空结果、截断都必须如实说明。
+- **`sql` 字段的含义**（2026-11-24）：`sql` 是**实际执行的语句**（Spec 07 `ExecutionResult.executed_sql`，含 LIMIT 改写与字面量），`options.explain_sql = false` 时为 `None`。MVP 的租户隔离在数据库视图与账号层，SQL 中没有隐藏的安全谓词，因此不另设预览。若以后启用 AST 行级改写（07 §2.2），必须把对外字段改为脱敏的 `sql_preview`（明确标注"预览"，不能复制回数据库执行），`executed_sql` 只对 `admin` 开放并审计。
 - `datasource_id` 必须等于 `Settings.datasource_id`。`release_id` 为空时取活跃 release（查询全程固定）；评测可指定候选 release。`initial_ir` 非空时跳过检索与理解，直接从实体解析/规划开始（Spec 09 的续问与澄清回答使用）。
 - 状态与 HTTP 无关；Spec 09 负责映射为 API 响应。
 - CLI：`uv run python -m text2sql.agent ask "问题" --user U [--as-of 2026-06-30] [--dry-run]`，以 `principal` 表中该用户身份执行，打印 SQL、结果前 20 行、口径、警告与 `trace_id`。
 - 删除 Spec 01 的 `echo` 节点与临时接口 `POST /api/v1/agent/echo` 及其测试（Spec 01 4.7 约定由本 Spec 删除）。
 - 2026-11-22：CLI `uv run python -m text2sql.agent export-example QUERY_ID --by NAME` 把一条 `completed` 且 `plan_mode = IR` 的 `query_execution` 导出为 Spec 05 S9 的 DRAFT 样例文件（`semantic_definitions/<model>/examples/<id>.yaml`：问题原文 + 规划后 IR，去掉 `assumptions`，实体过滤的 `values`/`labels` 清空），由人修改后提 PR。
-- `AgentPredictor`（`name = "agent"`）：用 `Principal(principal_id=0, user_id="eval", tenant_id=题目租户, role="analyst")` 调 `run_query(as_of=题目 as_of, release_id=运行的 release)`；`completed` → `ANSWER`（带结果，Runner 不再执行 SQL）；`needs_clarification` → `CLARIFY`（带澄清类型）；`rejected` → `REJECT`；`failed` → `ERROR`。多轮题在 Spec 09 提供续问前返回 `SKIPPED`。2026-11-22：`Prediction` 额外填写 `retrieval`（`ranked_tables`、命中指标与维度）、`candidate_agreement`、`llm_calls`、`context_tokens`（理解调用的输入 token 合计）；Spec 03 E10 干扰表压测传入派生数据源（`<datasource_id>__d<N>`）的候选 release 时，`run_query(..., allow_distractor_release=True)` 放行"release 的数据源是 `Settings.datasource_id` 加 `__d<N>` 后缀"的情形（只供评测；值索引与网关仍按真实数据源与题目租户执行；该模式下 `DB_UNKNOWN_TABLE`/`DB_UNKNOWN_COLUMN` 不调用 `mark_stale`，直接按失败计）。
+- `AgentPredictor`（`name = "agent"`）：用 `Principal(principal_id=0, user_id="eval", tenant_id=题目租户, role="analyst")` 调 `run_query(as_of=题目 as_of, release_id=运行的 release)`；`completed` → `ANSWER`（带结果，Runner 不再执行 SQL）；`needs_clarification` → `CLARIFY`（带澄清类型）；`rejected` → `REJECT`；`failed` 且 `error_code = OUT_OF_COVERAGE` → `ABSTAIN`（2026-11-24，Spec 03）；其他 `failed` → `ERROR`。多轮题在 Spec 09 提供续问前返回 `SKIPPED`。2026-11-22：`Prediction` 额外填写 `retrieval`（`ranked_tables`、命中指标与维度）、`candidate_agreement`、`llm_calls`、`context_tokens`（理解调用的输入 token 合计）；Spec 03 E10 干扰表压测传入派生数据源（`<datasource_id>__d<N>`）的候选 release 时，`run_query(..., allow_distractor_release=True)` 放行"release 的数据源是 `Settings.datasource_id` 加 `__d<N>` 后缀"的情形（只供评测；值索引与网关仍按真实数据源与题目租户执行；该模式下 `DB_UNKNOWN_TABLE`/`DB_UNKNOWN_COLUMN` 不调用 `mark_stale`，直接按失败计）。
 
 ### 4.15 自然语言类绕过用例（Spec 07 G8 的 `kind: nl`）
 
@@ -514,6 +559,8 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 11. （2026-11-22，投票）`FakeLLM` 脚本：3 个候选中 2 个规划后哈希相同 → 执行多数结果，`candidate_agreement = 2/3`；3 个候选只在指标上各不相同 → `METRIC_DEFINITION` 澄清；只在 `employee` 的角色上不同 → `JOIN_ROLE` 澄清；其他分歧 → 执行候选 1 并带 `LOW_AGREEMENT`；`understanding_samples = 1` 时只调用一次理解。
 12. （2026-11-22，实体）值索引中有"华东精密有限公司"时，"华东精密"解析为该客户的键，并带"按 … 匹配"警告；没有值索引构建时行为与原规则相同。
 13. （2026-11-22）`export-example` 导出的 YAML 能被 Spec 05 加载，`status = DRAFT`，实体过滤值为空。
+14. （2026-11-24）`httpx.MockTransport`：429 带 `Retry-After: 1` 且时限充足时重试一次成功；`Retry-After` 超过剩余时限时不重试并返回 `LLM_RATE_LIMITED`；剩余时限小于 `llm_timeout_s` 时超时不重试；累计 token 达到 `llm_max_tokens_per_query` 后不再调用模型并返回 `LLM_BUDGET_EXCEEDED`。
+15. （2026-11-24）默认配置下理解只调用 1 次；候选 1 `PlanFailed` 时补采到 3 个并投票；`OUT_OF_COVERAGE` 意图返回 `failed` + `OUT_OF_COVERAGE`，`AgentPredictor` 记为 `ABSTAIN`；兜底结果 `certified = false`，IR 结果 `certified = true`；父查询以 `pii_viewer` 身份完成后，把该用户的 `role` 改为 `analyst` 再续问"加上手机号"，续问被网关拒绝（`PERMISSION_DENIED`），证明每轮按当前身份重新授权、不继承父查询的结论。
 
 ## 6. 新增依赖
 
@@ -524,7 +571,7 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
 - **模型供应商未定**：第 5 周的真实评测依赖 11.6 的合规结论和可用的模型端点。结论未出时，开发与 CI 全部用 `FakeLLM`，第 5 周交付会缺少真实分数。这是第 5 周的关键外部依赖。
 - **不使用 Checkpointer**：澄清与续问通过 `query_execution` 中保存的 IR 和 `Clarification` 在新一轮重新进入工作流（`initial_ir`），不需要 LangGraph 中断恢复。代价是每轮重新绑定活跃 release（Spec 09 会检查 IR 在新 release 上的兼容性）。
 - **关键词检索的上限**：不分词的子串匹配依赖同义词维护质量；召回不足时表现为 LLM 选不到正确指标，评测中可见。按架构 8.5，以召回率实测决定是否进入阶段 B。
-- **多候选的成本与收益**（2026-11-22）：k = 3 使理解阶段的模型调用与 token 约为原来的 3 倍（并发执行，延迟增加有限）。收益来自调研中的同类方法，**在本项目上尚未实测**；第 5 周用 Spec 03 的 `candidate_agreement`、`llm_calls` 与 `understanding_samples = 1` 的对照运行比较准确率和成本，收益不明显时把默认值改为 1。
+- **多候选的成本与收益**（2026-11-22）：k = 3 使理解阶段的模型调用与 token 约为原来的 3 倍（并发执行，延迟增加有限）。收益来自调研中的同类方法，**在本项目上尚未实测**；第 5 周用 Spec 03 的 `candidate_agreement`、`llm_calls` 与 `understanding_samples = 1` 的对照运行比较准确率和成本，收益不明显时把默认值改为 1。2026-11-24：已先改为默认 1、按质量信号补采（4.5），第 5 周对照"始终 3 个"再定。
 - **值索引候选进入上下文**（2026-11-22）：命中值是业务数据，虽然只来自非敏感、低基数列，仍需要 11.6 合规结论确认（开放决策 5）。不允许时关闭"值索引命中"数据区，只在 A5 内部使用值索引（不发给模型）。
 - **歧义"影响"一律视为 HIGH** 是简化；误澄清率（22.2 要求 ≤ 10%）在评测中监控，偏高时优先给术语和维度补默认值，而不是放松规则。
 - **结果不落库**：`GET /api/v1/query/{id}` 只能返回元信息与 SQL，不能重新取回数据（见 Spec 09）。
@@ -533,4 +580,5 @@ def run_query(request: QueryRequest, principal: Principal, *, as_of: date | None
   2. 是否接受只实现 OpenAI 兼容协议这一种适配器。
   3. 是否开启 `llm_explain_results`（把统计摘要发给模型生成解释）。
   4. 查询结果是否需要在系统库中保留（影响 Spec 09 的"查看历史结果"）。
-  5. （2026-11-22）值索引命中的值能否放进模型上下文（与 Spec 02 开放决策 3 是同一个问题）；`understanding_samples` 默认 3 还是 1。
+  5. （2026-11-22）值索引命中的值能否放进模型上下文（与 Spec 02 开放决策 3 是同一个问题）；`understanding_samples` 默认 3 还是 1（2026-11-24：先定为 1，按信号补采，待第 5 周数据）。
+  6. （2026-11-24）兜底通道去留：见本 Spec 顶部的待定决策。

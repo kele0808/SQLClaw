@@ -89,6 +89,7 @@ tests/integration/ …
 | `business_db_timeout_s` | `T2S_BUSINESS_DB_TIMEOUT_S` | `int` | `5`（只作用于 `business_db_url` 连接，见 4.5） |
 | `job_poll_interval_s` | `T2S_JOB_POLL_INTERVAL_S` | `float` | `1.0` |
 | `job_lease_s` | `T2S_JOB_LEASE_S` | `int` | `300` |
+| `job_heartbeat_s` | `T2S_JOB_HEARTBEAT_S` | `int` | `60`（2026-11-24，见 4.6 租约续约；必须小于 `job_lease_s / 2`，启动校验） |
 
 - `get_settings()` 用 `functools.lru_cache` 返回单例；测试通过清缓存覆盖。
 - 连接串用 `SecretStr`，日志与错误信息中永远不输出明文。
@@ -182,6 +183,18 @@ class NonRetryableJobError(Exception):
 - `run_worker(stop_event: threading.Event)` 循环：领取任务，恢复 `trace_id`，调用 handler，成功则 `complete`；handler 抛出 `NonRetryableJobError` 时 `fail(..., retryable=False)`，直接置为 `failed`，不论剩余次数；其他异常 `fail(...)`，按退避重试；无任务时休眠 `job_poll_interval_s`。收到 SIGINT / SIGTERM 时处理完当前任务后退出。
 - 本期注册一个内置 `kind = "noop"` 的 handler 用于测试。
 
+**租约续约与心跳**（2026-11-24 新增，**待实现**：Spec 01 已交付的代码中没有续约；必须在 plan 02 Task 17 `metadata.value_index` 之前补上，原因是值采集要扫业务表、可能超过 `job_lease_s`，租约过期后任务会被另一个 worker 重新领取，同一任务并发执行两次）：
+
+```python
+def renew_lease(session: Session, job_id: int, attempt: int, lease_s: int) -> bool: ...
+```
+
+- `attempt` 是领取时的 `Job.attempts`，作为**领取令牌**：`claim` 每次 `attempts += 1`，所以重新领取后旧令牌自动失效。
+- `renew_lease`：一条 `UPDATE jobs SET locked_until = now() + lease_s, updated_at = now() WHERE id = :job_id AND status = 'running' AND attempts = :attempt`；更新 1 行返回 `True`，0 行（已被重新领取、已完成或已失败）返回 `False`。由调用方提交事务。
+- `complete` / `fail` 同样增加 `attempt` 参数并带同一条件；条件不满足时不修改任务、记 WARNING 日志 `job_lease_lost`（旧 worker 迟到的完成不覆盖新 worker 的状态）。
+- worker：handler 运行期间由一个守护线程每 `job_heartbeat_s` 秒用**独立的短事务**调用 `renew_lease`；返回 `False` 时置位 `lease_lost: threading.Event`，handler 可通过 `current_job_lease_lost()` 查询并尽快停止（长任务在每列、每批之间检查）；handler 返回后不再 `complete`。心跳线程本身的数据库异常只记日志、下次重试，连续失败到租约过期前仍未成功时同样置位 `lease_lost`。
+- 幂等：handler 仍需按"可能被执行多于一次"来写（例如 Spec 02 的快照按内容哈希去重、值索引以新的 build 写入并在最后切换），续约只降低重复执行的概率，不提供"恰好一次"的保证。
+
 ### 4.7 F7 LangGraph 挂载点
 
 - `text2sql.agent.graph.build_graph()` 返回编译后的 `StateGraph`，State 为 `TypedDict`：`{"question": str, "answer": str}`，只有一个节点 `echo`，将 `question` 原样写入 `answer`。
@@ -219,7 +232,7 @@ class NonRetryableJobError(Exception):
 4. 任意请求的响应头都带 `X-Trace-Id`；传入合法 `X-Trace-Id` 时原样返回；该请求的所有日志行带同一 `trace_id`。
 5. 未捕获异常返回统一错误结构，响应中不含堆栈和连接串。
 6. 使用 `t2s_ro` 账号对业务库执行写操作会失败（权限与只读会话双重保证），有集成测试覆盖；`get_business_engine()` 建立的连接上 PyMySQL `connect_timeout`、`read_timeout` 等于 `business_db_timeout_s`（单元测试检查连接参数）。
-7. 队列并发测试：入队 200 个 `noop` 任务，4 个线程并发领取，每个任务恰好执行一次；handler 抛异常的任务按退避重试，达到 `max_attempts` 后为 `failed`；handler 抛 `NonRetryableJobError` 的任务第一次失败即为 `failed`（`attempts = 1`）；租约过期的 `running` 任务可被重新领取。
+7. 队列并发测试：入队 200 个 `noop` 任务，4 个线程并发领取，每个任务恰好执行一次；handler 抛异常的任务按退避重试，达到 `max_attempts` 后为 `failed`；handler 抛 `NonRetryableJobError` 的任务第一次失败即为 `failed`（`attempts = 1`）；租约过期的 `running` 任务可被重新领取。（2026-11-24）续约：handler 运行时间超过 `job_lease_s` 但心跳正常时，任务不会被其他线程领取；用旧 `attempt` 调用 `renew_lease` / `complete` 返回 `False` 或不修改任务；心跳失败时 `current_job_lease_lost()` 为真。
 8. `POST /api/v1/agent/echo` 返回与输入相同的 `answer`；`POST /v1/agent/echo`（无前缀）返回 404。
 9. `uv run ruff check .`、`uv run ruff format --check .`、`uv run mypy`、`uv run pytest`、`uv run pytest -m integration` 全部通过。
 10. `AGENTS.md` 与 README 补充：如何启动 Compose、运行迁移、启动 API 和 worker、运行集成测试。
@@ -245,3 +258,4 @@ class NonRetryableJobError(Exception):
 | 2026-11-20 | 明确 `business_db_timeout_s` 只是 `t2s_ro` 连接的建立/读取超时 | 与 Spec 07 的查询超时、EXPLAIN 超时区分，避免混用 |
 | 2026-11-20 | Compose 默认只起数据库；约定 `api`、`worker` 放在可选 profile `app`，由 Spec 09 加入 | 与架构第二十一章 MVP 部署及 Spec 09 D6 一致 |
 | 2026-11-21 | 本地 `pg` 宿主机端口由 5432 改为 5433（容器内仍为 5432） | 开发机上 5432 常被其他项目的 PostgreSQL 占用 |
+| 2026-11-24 | 队列增加 `renew_lease`、worker 心跳、以 `attempts` 作领取令牌约束 `complete`/`fail`；新增配置 `job_heartbeat_s`（**待实现**，在 plan 02 Task 17 之前） | 原设计租约只在领取时设置一次，长任务（Spec 02 值索引）超过 `job_lease_s` 会被重复领取；采纳 Architecture Baseline 审阅结论（`docs/research/03-architecture-baseline-review.md`） |
