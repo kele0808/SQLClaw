@@ -1,6 +1,7 @@
 from alembic import context
 from sqlalchemy import create_engine, pool
 
+import text2sql.metadata.catalog.models  # noqa: F401  (registers Spec 02 tables on Base.metadata)
 from text2sql.common.config import get_settings
 from text2sql.common.logging import configure_logging
 from text2sql.db.models import Base
